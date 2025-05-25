@@ -3,7 +3,7 @@
 
 use aya_ebpf::{macros::{kprobe, map}, programs::ProbeContext};
 use aya_ebpf::maps::HashMap;
-use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_get_current_cgroup_id, bpf_get_current_comm};
+use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_ktime_get_ns};
 use aya_log_ebpf::info;
 
 #[kprobe]
@@ -34,6 +34,15 @@ pub struct ProcessInfo {
     _pad: u32,  // 添加填充以确保8字节对齐
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TrafficStats {
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub ip_traffic: u64,
+    pub last_activity: u64,
+}
+
 impl ProcessInfo {
     fn new(cgroup_id: u64, pid: u32, comm: [u8; 16], src_ip: u32, dst_ip: u32) -> Self {
         ProcessInfo {
@@ -47,14 +56,8 @@ impl ProcessInfo {
     }
 }
 
-#[map(name = "bytes_sent")]
-static mut BYTES_SENT: HashMap<ProcessInfo, u64> = HashMap::with_max_entries(327680, 0);
-
-#[map(name = "bytes_received")]
-static mut BYTES_RECEIVED: HashMap<ProcessInfo, u64> = HashMap::with_max_entries(327680, 0);
-
-#[map(name = "ip_traffic")]
-static mut IP_TRAFFIC: HashMap<ProcessInfo, u64> = HashMap::with_max_entries(327680, 0);
+#[map(name = "traffic_stats")]
+static mut TRAFFIC_STATS: HashMap<ProcessInfo, TrafficStats> = HashMap::with_max_entries(600000, 0);
 
 fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
     // 获取 tcp_sendmsg 的参数
@@ -93,44 +96,38 @@ fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
     
     let process_info = ProcessInfo::new(cgroup_id, pid, comm, src_ip, dst_ip);
     
-    // 更新发送计数器
+    // 更新统计信息
     unsafe {
-        let current = match BYTES_SENT.get(&process_info) {
+        let mut stats = match TRAFFIC_STATS.get(&process_info) {
             Some(val) => *val,
-            None => 0,
+            None => TrafficStats {
+                bytes_sent: 0,
+                bytes_received: 0,
+                ip_traffic: 0,
+                last_activity: 0,
+            },
         };
         
         // 检查是否会发生溢出
-        if current > u64::MAX - size as u64 {
+        if stats.bytes_sent > u64::MAX - size as u64 {
             info!(&ctx, "Send counter overflow detected for cgroup={}, pid={}, current={}, adding={}", 
-                cgroup_id, pid, current, size);
+                cgroup_id, pid, stats.bytes_sent, size);
             return Err(1);
         }
         
-        let new_value = current + size as u64;
-        
-        if let Err(e) = BYTES_SENT.insert(&process_info, &new_value, 0) {
-            info!(&ctx, "Failed to update send counter for cgroup={}, pid={}: error={}", 
-                cgroup_id, pid, e);
-            return Err(1);
-        }
-
-        // 更新IP流量统计
-        let current_ip = match IP_TRAFFIC.get(&process_info) {
-            Some(val) => *val,
-            None => 0,
-        };
-        
-        if current_ip > u64::MAX - size as u64 {
+        if stats.ip_traffic > u64::MAX - size as u64 {
             info!(&ctx, "IP traffic counter overflow detected for cgroup={}, pid={}, current={}, adding={}", 
-                cgroup_id, pid, current_ip, size);
+                cgroup_id, pid, stats.ip_traffic, size);
             return Err(1);
         }
         
-        let new_ip_value = current_ip + size as u64;
+        // 更新统计信息
+        stats.bytes_sent += size as u64;
+        stats.ip_traffic += size as u64;
+        stats.last_activity = bpf_ktime_get_ns();
         
-        if let Err(e) = IP_TRAFFIC.insert(&process_info, &new_ip_value, 0) {
-            info!(&ctx, "Failed to update IP traffic counter for cgroup={}, pid={}: error={}", 
+        if let Err(e) = TRAFFIC_STATS.insert(&process_info, &stats, 0) {
+            info!(&ctx, "Failed to update traffic stats for cgroup={}, pid={}: error={}", 
                 cgroup_id, pid, e);
             return Err(1);
         }
@@ -176,44 +173,38 @@ fn try_traffic_collector_recv(ctx: ProbeContext) -> Result<u32, u32> {
     
     let process_info = ProcessInfo::new(cgroup_id, pid, comm, src_ip, dst_ip);
     
-    // 更新接收计数器
+    // 更新统计信息
     unsafe {
-        let current = match BYTES_RECEIVED.get(&process_info) {
+        let mut stats = match TRAFFIC_STATS.get(&process_info) {
             Some(val) => *val,
-            None => 0,
+            None => TrafficStats {
+                bytes_sent: 0,
+                bytes_received: 0,
+                ip_traffic: 0,
+                last_activity: 0,
+            },
         };
         
         // 检查是否会发生溢出
-        if current > u64::MAX - size as u64 {
+        if stats.bytes_received > u64::MAX - size as u64 {
             info!(&ctx, "Receive counter overflow detected for cgroup={}, pid={}, current={}, adding={}", 
-                cgroup_id, pid, current, size);
+                cgroup_id, pid, stats.bytes_received, size);
             return Err(1);
         }
         
-        let new_value = current + size as u64;
-        
-        if let Err(e) = BYTES_RECEIVED.insert(&process_info, &new_value, 0) {
-            info!(&ctx, "Failed to update receive counter for cgroup={}, pid={}: error={}", 
-                cgroup_id, pid, e);
-            return Err(1);
-        }
-
-        // 更新IP流量统计
-        let current_ip = match IP_TRAFFIC.get(&process_info) {
-            Some(val) => *val,
-            None => 0,
-        };
-        
-        if current_ip > u64::MAX - size as u64 {
+        if stats.ip_traffic > u64::MAX - size as u64 {
             info!(&ctx, "IP traffic counter overflow detected for cgroup={}, pid={}, current={}, adding={}", 
-                cgroup_id, pid, current_ip, size);
+                cgroup_id, pid, stats.ip_traffic, size);
             return Err(1);
         }
         
-        let new_ip_value = current_ip + size as u64;
+        // 更新统计信息
+        stats.bytes_received += size as u64;
+        stats.ip_traffic += size as u64;
+        stats.last_activity = bpf_ktime_get_ns();
         
-        if let Err(e) = IP_TRAFFIC.insert(&process_info, &new_ip_value, 0) {
-            info!(&ctx, "Failed to update IP traffic counter for cgroup={}, pid={}: error={}", 
+        if let Err(e) = TRAFFIC_STATS.insert(&process_info, &stats, 0) {
+            info!(&ctx, "Failed to update traffic stats for cgroup={}, pid={}: error={}", 
                 cgroup_id, pid, e);
             return Err(1);
         }
