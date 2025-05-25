@@ -2,13 +2,18 @@ use aya::programs::KProbe;
 #[rustfmt::skip]
 use log::{debug, warn, info, error};
 use tokio::signal;
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, sleep_until, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::process::Command;
 use std::path::Path;
 use aya::Pod;
+use chrono::{DateTime, Local, Timelike};
+use env_logger::Builder;
+use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::BufWriter;
 
 // 全局计数器
 static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
@@ -21,6 +26,8 @@ pub struct ProcessInfo {
     pub cgroup_id: u64,
     pub pid: u32,
     pub comm: [u8; 16],
+    pub src_ip: u32,     // 源IP地址
+    pub dst_ip: u32,     // 目标IP地址
     _pad: u32,  // 添加填充以确保8字节对齐
 }
 
@@ -81,13 +88,120 @@ fn get_process_name(comm: &[u8; 16]) -> String {
     String::from_utf8_lossy(&comm[..null_pos]).to_string()
 }
 
+// 添加IP地址格式化函数
+fn format_ip(ip: u32) -> String {
+    let octets = [
+        (ip >> 24) & 0xFF,
+        (ip >> 16) & 0xFF,
+        (ip >> 8) & 0xFF,
+        ip & 0xFF,
+    ];
+    format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+}
+
+// 添加写入日志文件的函数
+fn write_stats_to_file(
+    process_traffic: &HashMap<ProcessInfo, (u64, u64)>,
+    ip_traffic: &HashMap<(u32, u32), u64>,
+    total_sent: u64,
+    total_received: u64,
+    timestamp: DateTime<Local>,
+) -> anyhow::Result<()> {
+    // 确保日志目录存在
+    let log_dir = Path::new("/var/log/mx-cIndicator");
+    if !log_dir.exists() {
+        fs::create_dir_all(log_dir)?;
+    }
+
+    // 创建日志文件名，使用时间戳
+    let filename = format!("{}/traffic_stats_{}.prom", 
+        log_dir.display(),
+        timestamp.format("%Y%m%d_%H%M%S")
+    );
+
+    // 打开文件用于写入
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .append(false)
+        .open(&filename)?;
+    let mut writer = BufWriter::new(file);
+
+    // 写入进程流量统计
+    for (process_info, (sent, received)) in process_traffic.iter() {
+        let cgroup_name = get_cgroup_name(process_info.cgroup_id);
+        let process_name = get_process_name(&process_info.comm);
+        
+        writeln!(writer, "ebpf_traffic_bytes_sent{{CGroup=\"{}\",PID=\"{}\",Process=\"{}\"}} {} {}",
+            cgroup_name,
+            process_info.pid,
+            process_name,
+            sent,
+            timestamp.timestamp()
+        )?;
+
+        writeln!(writer, "ebpf_traffic_bytes_received{{CGroup=\"{}\",PID=\"{}\",Process=\"{}\"}} {} {}",
+            cgroup_name,
+            process_info.pid,
+            process_name,
+            received,
+            timestamp.timestamp()
+        )?;
+
+        writeln!(writer, "ebpf_traffic_bytes_total{{CGroup=\"{}\",PID=\"{}\",Process=\"{}\"}} {} {}",
+            cgroup_name,
+            process_info.pid,
+            process_name,
+            sent + received,
+            timestamp.timestamp()
+        )?;
+    }
+
+    // 写入IP流量统计
+    for ((src_ip, dst_ip), bytes) in ip_traffic.iter() {
+        writeln!(writer, "ebpf_ip_traffic_1m_stats{{sip=\"{}\",dip=\"{}\"}} {} {}",
+            format_ip(*src_ip),
+            format_ip(*dst_ip),
+            bytes,
+            timestamp.timestamp()
+        )?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 设置日志级别为 debug 以获取更多信息
-    std::env::set_var("RUST_LOG", "info");
-    env_logger::init();
+    // 设置日志格式和级别
+    let mut builder = Builder::from_default_env();
+    builder
+        .format(|buf, record| {
+            // 对于统计信息的特殊处理
+            if record.args().to_string().contains("Traffic stats") {
+                writeln!(buf, "\n{}", record.args())
+            } else if record.args().to_string().contains("Total Traffic") {
+                writeln!(buf, "\n{}", record.args())
+            } else if record.args().to_string().contains("Map usage") {
+                writeln!(buf, "\n{}", record.args())
+            } else if record.args().to_string().contains("IP Traffic stats") {
+                writeln!(buf, "\n{}", record.args())
+            } else if record.args().to_string().contains("-----") {
+                // 跳过分隔线的日志记录
+                Ok(())
+            } else {
+                writeln!(buf,
+                    "{} [{}] - {}",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    record.level(),
+                    record.args()
+                )
+            }
+        })
+        .filter(None, log::LevelFilter::Info)
+        .init();
 
-    println!("Starting traffic collector...");
+    info!("Starting traffic collector...");
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -100,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    println!("Loading eBPF program...");
+    info!("Loading eBPF program...");
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/traffic-collector"
@@ -113,7 +227,7 @@ async fn main() -> anyhow::Result<()> {
         info!("eBPF logger initialized successfully");
     }
 
-    println!("Starting eBPF monitoring...");
+    info!("Starting eBPF monitoring...");
     // 启动 eBPF 任务
     let ebpf_handle = tokio::spawn(async move {
         // 获取并加载程序
@@ -125,12 +239,13 @@ async fn main() -> anyhow::Result<()> {
         program_recv.load().unwrap();
         program_recv.attach("tcp_recvmsg", 0).unwrap();
         
-        println!("eBPF programs attached successfully");
+        info!("eBPF programs attached successfully");
 
         // 初始化 maps
         let mut maps = ebpf.maps_mut();
         let mut bytes_sent_map = None;
         let mut bytes_received_map = None;
+        let mut ip_traffic_map = None;
 
         for (name, map) in maps {
             match name {
@@ -140,155 +255,183 @@ async fn main() -> anyhow::Result<()> {
                 "bytes_received" => {
                     bytes_received_map = Some(aya::maps::HashMap::<&mut aya::maps::MapData, ProcessInfo, u64>::try_from(map).unwrap());
                 }
+                "ip_traffic" => {
+                    ip_traffic_map = Some(aya::maps::HashMap::<&mut aya::maps::MapData, ProcessInfo, u64>::try_from(map).unwrap());
+                }
                 _ => {}
             }
         }
 
         let mut bytes_sent_map: aya::maps::HashMap<&mut aya::maps::MapData, ProcessInfo, u64> = bytes_sent_map.expect("bytes_sent map not found");
         let mut bytes_received_map: aya::maps::HashMap<&mut aya::maps::MapData, ProcessInfo, u64> = bytes_received_map.expect("bytes_received map not found");
-        println!("Maps initialized successfully");
+        let mut ip_traffic_map: aya::maps::HashMap<&mut aya::maps::MapData, ProcessInfo, u64> = ip_traffic_map.expect("ip_traffic map not found");
+        info!("Maps initialized successfully");
 
-        let mut interval = time::interval(Duration::from_secs(60));
         println!("Starting traffic monitoring...");
+        let mut last_print_time = Local::now();
+        
         loop {
-            interval.tick().await;
-            
-            // 获取当前所有进程的流量数据
-            let mut process_traffic: HashMap<ProcessInfo, (u64, u64)> = HashMap::new();
-            let mut total_sent: u64 = 0;
-            let mut total_received: u64 = 0;
-            let mut map_size: usize = 0;
-            
-            // 获取所有当前有流量的进程数据
-            for entry in bytes_sent_map.iter() {
-                match entry {
-                    Ok((process_info, bytes)) => {
-                        map_size += 1;
-                        if bytes > 0 {
-                            let entry = process_traffic.entry(process_info.clone()).or_insert((0, 0));
-                            entry.0 = bytes;
-                            total_sent += bytes;
-                            debug!("Found sent traffic for cgroup={}, pid={}, comm={}: {} bytes", 
-                                process_info.cgroup_id, 
-                                process_info.pid,
-                                get_process_name(&process_info.comm),
-                                bytes);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error reading sent map entry: {:?}", e);
-                        continue;
-                    }
-                }
-            }
-
-            for entry in bytes_received_map.iter() {
-                match entry {
-                    Ok((process_info, bytes)) => {
-                        map_size += 1;
-                        if bytes > 0 {
-                            let entry = process_traffic.entry(process_info.clone()).or_insert((0, 0));
-                            entry.1 = bytes;
-                            total_received += bytes;
-                            debug!("Found received traffic for cgroup={}, pid={}, comm={}: {} bytes", 
-                                process_info.cgroup_id, 
-                                process_info.pid,
-                                get_process_name(&process_info.comm),
-                                bytes);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error reading received map entry: {:?}", e);
-                        continue;
-                    }
-                }
-            }
-
-            // 打印 map 使用情况
-            println!("Map usage: {}/327680 entries", map_size);
-            if map_size > 30000 {
-                warn!("Map is approaching capacity limit!");
-            }
-
-            // 打印每个进程的流量
-            println!("\nTraffic stats for last minute:");
-            println!("{:<20} {:<8} {:<20} {:<15} {:<15} {:<15}", 
-                "CGroup", "PID", "Process", "Bytes Sent", "Bytes Received", "Total");
-            println!("{:-<95}", "");
-            
-            if process_traffic.is_empty() {
-                println!("No traffic detected in the last minute");
+            // 计算下一个整分钟的时间
+            let now = Local::now();
+            let next_minute = if now.second() == 0 {
+                now
             } else {
-                for (process_info, (sent, received)) in process_traffic.iter() {
-                    let cgroup_name = get_cgroup_name(process_info.cgroup_id);
-                    let process_name = get_process_name(&process_info.comm);
-                    
-                    println!("{:<20} {:<8} {:<20} {:<15} {:<15} {:<15}", 
-                        cgroup_name,
-                        process_info.pid,
-                        process_name,
-                        format_bytes(*sent),
-                        format_bytes(*received),
-                        format_bytes(sent + received));
-                    
-                    // 重置计数器
-                    match bytes_sent_map.remove(process_info) {
-                        Ok(_) => debug!("Successfully reset sent counter for cgroup={}, pid={}", 
-                            process_info.cgroup_id, process_info.pid),
-                        Err(e) => {
-                            if !e.to_string().contains("No such file or directory") {
-                                debug!("Failed to reset sent counter for cgroup={}, pid={}: {:?}", 
-                                    process_info.cgroup_id, process_info.pid, e);
+                now + chrono::Duration::seconds(60 - now.second() as i64)
+            };
+            
+            // 等待到下一个整分钟
+            let wait_duration = (next_minute - now).num_milliseconds() as u64;
+            if wait_duration > 0 {
+                sleep_until(Instant::now() + Duration::from_millis(wait_duration)).await;
+            }
+
+            // 获取当前时间
+            let current_time = Local::now();
+            
+            // 只有当距离上次打印超过1分钟时才打印统计信息
+            if (current_time - last_print_time).num_seconds() >= 60 {
+                // 获取当前所有进程的流量数据
+                let mut process_traffic: HashMap<ProcessInfo, (u64, u64)> = HashMap::new();
+                let mut ip_traffic: HashMap<(u32, u32), u64> = HashMap::new();
+                let mut total_sent: u64 = 0;
+                let mut total_received: u64 = 0;
+                let mut map_size: usize = 0;
+                
+                // 获取所有当前有流量的进程数据
+                for entry in bytes_sent_map.iter() {
+                    match entry {
+                        Ok((process_info, bytes)) => {
+                            map_size += 1;
+                            if bytes > 0 {
+                                let entry = process_traffic.entry(process_info.clone()).or_insert((0, 0));
+                                entry.0 = bytes;
+                                total_sent += bytes;
+                                debug!("Found sent traffic for cgroup={}, pid={}, comm={}: {} bytes", 
+                                    process_info.cgroup_id, 
+                                    process_info.pid,
+                                    get_process_name(&process_info.comm),
+                                    bytes);
                             }
                         }
-                    }
-                    match bytes_received_map.remove(process_info) {
-                        Ok(_) => debug!("Successfully reset received counter for cgroup={}, pid={}", 
-                            process_info.cgroup_id, process_info.pid),
                         Err(e) => {
-                            if !e.to_string().contains("No such file or directory") {
-                                debug!("Failed to reset received counter for cgroup={}, pid={}: {:?}", 
-                                    process_info.cgroup_id, process_info.pid, e);
-                            }
+                            error!("Error reading sent map entry: {:?}", e);
+                            continue;
                         }
                     }
                 }
+
+                for entry in bytes_received_map.iter() {
+                    match entry {
+                        Ok((process_info, bytes)) => {
+                            map_size += 1;
+                            if bytes > 0 {
+                                let entry = process_traffic.entry(process_info.clone()).or_insert((0, 0));
+                                entry.1 = bytes;
+                                total_received += bytes;
+                                debug!("Found received traffic for cgroup={}, pid={}, comm={}: {} bytes", 
+                                    process_info.cgroup_id, 
+                                    process_info.pid,
+                                    get_process_name(&process_info.comm),
+                                    bytes);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error reading received map entry: {:?}", e);
+                            continue;
+                        }
+                    }
+                }
+
+                // 获取IP流量统计
+                for entry in ip_traffic_map.iter() {
+                    match entry {
+                        Ok((process_info, bytes)) => {
+                            map_size += 1;
+                            if bytes > 0 {
+                                let key = (process_info.src_ip, process_info.dst_ip);
+                                let entry = ip_traffic.entry(key).or_insert(0);
+                                *entry += bytes;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error reading IP traffic map entry: {:?}", e);
+                            continue;
+                        }
+                    }
+                }
+
+                // 写入统计信息到文件
+                if let Err(e) = write_stats_to_file(
+                    &process_traffic,
+                    &ip_traffic,
+                    total_sent,
+                    total_received,
+                    current_time,
+                ) {
+                    error!("Failed to write stats to file: {}", e);
+                }
+
+                // 打印统计信息
+                info!("Map usage: {}/327680 entries", map_size);
+                if map_size > 30000 {
+                    warn!("Map is approaching capacity limit!");
+                }
+
+                info!("Traffic stats for last minute:");
+                info!("{:<20} {:<8} {:<20} {:<15} {:<15} {:<15}", 
+                    "CGroup", "PID", "Process", "Bytes Sent", "Bytes Received", "Total");
+                
+                if process_traffic.is_empty() {
+                    info!("No traffic detected in the last minute");
+                } else {
+                    for (process_info, (sent, received)) in process_traffic.iter() {
+                        let cgroup_name = get_cgroup_name(process_info.cgroup_id);
+                        let process_name = get_process_name(&process_info.comm);
+                        
+                        info!("{:<20} {:<8} {:<20} {:<15} {:<15} {:<15}", 
+                            cgroup_name,
+                            process_info.pid,
+                            process_name,
+                            sent,
+                            received,
+                            sent + received);
+                    }
+                }
+
+                info!("\nIP Traffic stats for last minute:");
+                info!("{:<20} {:<20} {:<15}", "Source IP", "Destination IP", "Total Traffic");
+                
+                if ip_traffic.is_empty() {
+                    info!("No IP traffic detected in the last minute");
+                } else {
+                    for ((src_ip, dst_ip), bytes) in ip_traffic.iter() {
+                        info!("{:<20} {:<20} {:<15}", 
+                            format_ip(*src_ip),
+                            format_ip(*dst_ip),
+                            bytes);
+                    }
+                }
+
+                info!("\nTotal Traffic:");
+                info!("{:<20} {}", "Sent:", total_sent);
+                info!("{:<20} {}", "Received:", total_received);
+                info!("{:<20} {}", "Total:", total_sent + total_received);
+
+                // 更新上次打印时间
+                last_print_time = current_time;
             }
-            println!("{:-<95}", "");
-            println!("Total Traffic:");
-            println!("{:<20} {}", "Sent:", format_bytes(total_sent));
-            println!("{:<20} {}", "Received:", format_bytes(total_received));
-            println!("{:<20} {}", "Total:", format_bytes(total_sent + total_received));
-            println!("{:-<95}", "\n");
         }
     });
 
     // 等待 Ctrl-C
     let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
+    info!("Waiting for Ctrl-C...");
     ctrl_c.await?;
-    println!("Exiting...");
+    info!("Exiting...");
 
     // 停止 eBPF 任务
     ebpf_handle.abort();
 
     Ok(())
-}
-
-// 添加一个辅助函数来格式化字节数
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }
 
