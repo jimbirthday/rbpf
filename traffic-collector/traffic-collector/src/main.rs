@@ -21,6 +21,7 @@ pub struct ProcessInfo {
     pub cgroup_id: u64,
     pub pid: u32,
     pub comm: [u8; 16],
+    _pad: u32,  // 添加填充以确保8字节对齐
 }
 
 // 实现 Pod trait
@@ -74,9 +75,10 @@ fn get_cgroup_name(cgroup_id: u64) -> String {
 
 // 获取进程名的辅助函数
 fn get_process_name(comm: &[u8; 16]) -> String {
-    String::from_utf8_lossy(comm)
-        .trim_end_matches('\0')
-        .to_string()
+    // 找到第一个 null 字节的位置
+    let null_pos = comm.iter().position(|&x| x == 0).unwrap_or(16);
+    // 只转换到 null 字节之前的内容
+    String::from_utf8_lossy(&comm[..null_pos]).to_string()
 }
 
 #[tokio::main]
@@ -203,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // 打印 map 使用情况
-            println!("Map usage: {}/32768 entries", map_size);
+            println!("Map usage: {}/327680 entries", map_size);
             if map_size > 30000 {
                 warn!("Map is approaching capacity limit!");
             }
