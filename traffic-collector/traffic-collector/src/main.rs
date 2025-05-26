@@ -171,20 +171,24 @@ fn write_stats_to_file(
     }
 
     // 写入IP流量统计
-    // 合并源IP和目标IP的流量统计
-    let mut ip_agg: HashMap<u32, u64> = HashMap::new();
+    // 按源IP+目标IP组合聚合
+    let mut ip_pair_agg: HashMap<(u32, u32), u64> = HashMap::new();
     
     for ((src_ip, dst_ip), bytes) in ip_traffic.iter() {
-        // 聚合源IP流量
-        *ip_agg.entry(*src_ip).or_insert(0) += bytes;
-        // 聚合目标IP流量
-        *ip_agg.entry(*dst_ip).or_insert(0) += bytes;
+        // 确保源IP和目标IP的顺序一致（较小的IP作为源IP）
+        let (src, dst) = if src_ip <= dst_ip {
+            (*src_ip, *dst_ip)
+        } else {
+            (*dst_ip, *src_ip)
+        };
+        *ip_pair_agg.entry((src, dst)).or_insert(0) += bytes;
     }
 
-    // 写入合并后的IP流量统计
-    for (ip, bytes) in ip_agg.iter() {
-        writeln!(writer, "ebpf_ip_traffic_1m_stats{{ip=\"{}\"}} {}",
-            format_ip(*ip),
+    // 写入聚合后的IP对统计
+    for ((src_ip, dst_ip), bytes) in ip_pair_agg.iter() {
+        writeln!(writer, "ebpf_ip_traffic_1m_stats{{sip=\"{}\",dip=\"{}\"}} {}",
+            format_ip(*src_ip),
+            format_ip(*dst_ip),
             bytes
         )?;
     }
