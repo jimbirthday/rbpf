@@ -14,6 +14,177 @@ use env_logger::Builder;
 use std::io::Write;
 use std::fs::{self, File, OpenOptions};
 use std::io::BufWriter;
+use std::io::BufReader;
+use std::io::prelude::*;
+use serde_json::Value;
+use clap::Parser;
+
+/// 流量收集器配置
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// 过滤规则文件路径
+    #[arg(short, long, default_value = "rules.json")]
+    rules: String,
+
+    /// 日志文件目录
+    #[arg(short = 'l', long, default_value = "/var/log/mx-cIndicator")]
+    log_dir: String,
+
+    /// 日志保留天数（0表示不清理）
+    #[arg(short = 'd', long, default_value = "7")]
+    log_retention_days: u64,
+
+    /// 日志级别 (debug, info, warn, error)
+    #[arg(short = 'v', long, default_value = "info")]
+    log_level: String,
+}
+
+// 通配符匹配函数
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let text_chars: Vec<char> = text.chars().collect();
+    let mut pattern_idx = 0;
+    let mut text_idx = 0;
+    let mut star_idx = -1;
+    let mut match_idx = 0;
+
+    while text_idx < text_chars.len() {
+        if pattern_idx < pattern_chars.len() && 
+           (pattern_chars[pattern_idx] == '?' || pattern_chars[pattern_idx] == text_chars[text_idx]) {
+            pattern_idx += 1;
+            text_idx += 1;
+        } else if pattern_idx < pattern_chars.len() && pattern_chars[pattern_idx] == '*' {
+            star_idx = pattern_idx as i32;
+            match_idx = text_idx;
+            pattern_idx += 1;
+        } else if star_idx != -1 {
+            pattern_idx = (star_idx + 1) as usize;
+            match_idx += 1;
+            text_idx = match_idx;
+        } else {
+            return false;
+        }
+    }
+
+    // 处理模式末尾的星号
+    while pattern_idx < pattern_chars.len() && pattern_chars[pattern_idx] == '*' {
+        pattern_idx += 1;
+    }
+
+    // 如果模式已经匹配完，或者只剩下星号，则匹配成功
+    pattern_idx == pattern_chars.len()
+}
+
+// 过滤规则结构
+#[derive(Debug, Clone)]
+struct FilterRule {
+    cgroup_pattern: Option<String>,
+    pid_pattern: Option<String>,
+    process_pattern: Option<String>,
+    src_ip_pattern: Option<String>,
+    dst_ip_pattern: Option<String>,
+}
+
+impl FilterRule {
+    // 检查进程是否匹配规则（白名单）
+    fn matches_process(&self, process_info: &ProcessInfo) -> bool {
+        // 检查 cgroup
+        let cgroup_match = self.cgroup_pattern.as_ref().map_or(true, |pattern| {
+            let cgroup_name = get_cgroup_name(process_info.cgroup_id);
+            wildcard_match(pattern, &cgroup_name)
+        });
+        
+        // 检查进程名
+        let process_match = self.process_pattern.as_ref().map_or(true, |pattern| {
+            let process_name = get_process_name(&process_info.comm);
+            wildcard_match(pattern, &process_name)
+        });
+        
+        // 进程规则只需要匹配进程相关的条件
+        cgroup_match && process_match
+    }
+
+    // 检查IP是否匹配规则（黑名单）
+    fn matches_ip(&self, src_ip: u32, dst_ip: u32) -> bool {
+        let src_ip_str = format_ip(src_ip);
+        let dst_ip_str = format_ip(dst_ip);
+        
+        // 如果规则中有IP相关的模式，检查是否匹配
+        let src_match = self.src_ip_pattern.as_ref().map_or(false, |pattern| 
+            wildcard_match(pattern, &src_ip_str));
+        let dst_match = self.dst_ip_pattern.as_ref().map_or(false, |pattern| 
+            wildcard_match(pattern, &dst_ip_str));
+        
+        // IP规则只需要匹配IP相关的条件
+        src_match || dst_match
+    }
+}
+
+// 检查进程是否应该被包含（白名单）
+fn should_include_process(process_info: &ProcessInfo, filter_rules: &[FilterRule]) -> bool {
+    if filter_rules.is_empty() {
+        true // 如果没有规则，包含所有流量
+    } else {
+        filter_rules.iter().any(|rule| rule.matches_process(process_info))
+    }
+}
+
+// 检查IP是否应该被排除（黑名单）
+fn should_exclude_ip(src_ip: u32, dst_ip: u32, filter_rules: &[FilterRule]) -> bool {
+    if filter_rules.is_empty() {
+        false // 如果没有规则，不排除任何IP
+    } else {
+        filter_rules.iter().any(|rule| rule.matches_ip(src_ip, dst_ip))
+    }
+}
+
+// 加载过滤规则
+fn load_filter_rules(file_path: &str) -> anyhow::Result<Vec<FilterRule>> {
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+    let json: Value = serde_json::from_reader(reader)?;
+    
+    let mut rules = Vec::new();
+    
+    // 确保根节点是数组
+    if let Value::Array(rules_array) = json {
+        for rule_value in rules_array {
+            if let Value::Object(rule_obj) = rule_value {
+                let mut rule = FilterRule {
+                    cgroup_pattern: None,
+                    pid_pattern: None,
+                    process_pattern: None,
+                    src_ip_pattern: None,
+                    dst_ip_pattern: None,
+                };
+                
+                // 解析规则字段
+                if let Some(Value::String(pattern)) = rule_obj.get("cgroup") {
+                    rule.cgroup_pattern = Some(pattern.clone());
+                }
+                if let Some(Value::String(pattern)) = rule_obj.get("pid") {
+                    rule.pid_pattern = Some(pattern.clone());
+                }
+                if let Some(Value::String(pattern)) = rule_obj.get("process") {
+                    rule.process_pattern = Some(pattern.clone());
+                }
+                if let Some(Value::String(pattern)) = rule_obj.get("src_ip") {
+                    rule.src_ip_pattern = Some(pattern.clone());
+                }
+                if let Some(Value::String(pattern)) = rule_obj.get("dst_ip") {
+                    rule.dst_ip_pattern = Some(pattern.clone());
+                }
+                
+                rules.push(rule);
+            }
+        }
+    } else {
+        return Err(anyhow::anyhow!("Filter rules must be an array"));
+    }
+    
+    Ok(rules)
+}
 
 // 全局计数器
 static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
@@ -40,10 +211,12 @@ pub struct ProcessInfo {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TrafficStats {
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub ip_traffic: u64,
-    pub last_activity: u64,
+    pub bytes_sent: u64,      // 8 bytes
+    pub bytes_received: u64,  // 8 bytes
+    pub last_activity: u64,   // 8 bytes
+    pub src_ip: u64,          // 8 bytes (包含 src_ip 和 padding)
+    pub dst_ip: u64,          // 8 bytes (包含 dst_ip 和 padding)
+    pub direction: u64,       // 8 bytes (包含 direction 和 padding)
 }
 
 // 实现 Pod trait
@@ -55,6 +228,8 @@ impl std::hash::Hash for ProcessInfo {
         self.cgroup_id.hash(state);
         self.pid.hash(state);
         self.comm.hash(state);
+        self.src_ip.hash(state);
+        self.dst_ip.hash(state);
     }
 }
 
@@ -62,7 +237,9 @@ impl PartialEq for ProcessInfo {
     fn eq(&self, other: &Self) -> bool {
         self.cgroup_id == other.cgroup_id && 
         self.pid == other.pid && 
-        self.comm == other.comm
+        self.comm == other.comm &&
+        self.src_ip == other.src_ip &&
+        self.dst_ip == other.dst_ip
     }
 }
 
@@ -115,13 +292,11 @@ fn format_ip(ip: u32) -> String {
     format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
 }
 
-// 添加写入日志文件的函数
+// 写入统计信息到文件
 fn write_stats_to_file(
-    process_traffic: &HashMap<ProcessInfo, (u64, u64)>,
-    ip_traffic: &HashMap<(u32, u32), u64>,
-    total_sent: u64,
-    total_received: u64,
+    traffic_stats: &HashMap<ProcessInfo, TrafficStats>,
     timestamp: DateTime<Local>,
+    filter_rules: &[FilterRule],
 ) -> anyhow::Result<()> {
     // 确保日志目录存在
     let log_dir = Path::new("/var/log/mx-cIndicator");
@@ -143,54 +318,71 @@ fn write_stats_to_file(
         .open(&filename)?;
     let mut writer = BufWriter::new(file);
 
-    // 写入进程流量统计
-    for (process_info, (sent, received)) in process_traffic.iter() {
+    // 按进程和IP对聚合流量统计
+    let mut traffic_agg: HashMap<(ProcessInfo, u32, u32), (u64, u64)> = HashMap::new();
+    let mut debug_total_sent: u64 = 0;
+    let mut debug_total_received: u64 = 0;
+
+    // 遍历所有流量记录
+    for (process_info, stats) in traffic_stats.iter() {
+        // 确保源IP和目标IP的顺序一致（较小的IP作为源IP）
+        let (src, dst) = if stats.src_ip <= stats.dst_ip {
+            (stats.src_ip as u32, stats.dst_ip as u32)
+        } else {
+            (stats.dst_ip as u32, stats.src_ip as u32)
+        };
+
+        // 如果不应该排除这个IP，则包含它
+        if !should_exclude_ip(src, dst, filter_rules) {
+            // 更新聚合统计
+            let key = (*process_info, src, dst);
+            let entry = traffic_agg.entry(key).or_insert((0, 0));
+            
+            // 根据方向更新发送和接收的字节数
+            if stats.direction == 0 {
+                entry.0 += stats.bytes_sent;
+                debug_total_sent += stats.bytes_sent;
+            } else {
+                entry.1 += stats.bytes_received;
+                debug_total_received += stats.bytes_received;
+            }
+        }
+    }
+
+    debug!("Aggregated traffic - Total sent: {}, Total received: {}", debug_total_sent, debug_total_received);
+
+    // 写入聚合后的流量统计
+    for ((process_info, src_ip, dst_ip), (sent, received)) in traffic_agg.iter() {
         let cgroup_name = get_cgroup_name(process_info.cgroup_id);
         let process_name = get_process_name(&process_info.comm);
         
-        writeln!(writer, "ebpf_traffic_bytes_sent{{CGroup=\"{}\",PID=\"{}\",Process=\"{}\"}} {}",
-            cgroup_name,
-            process_info.pid,
-            process_name,
-            sent
-        )?;
-
-        writeln!(writer, "ebpf_traffic_bytes_received{{CGroup=\"{}\",PID=\"{}\",Process=\"{}\"}} {}",
-            cgroup_name,
-            process_info.pid,
-            process_name,
-            received
-        )?;
-
-        writeln!(writer, "ebpf_traffic_bytes_total{{CGroup=\"{}\",PID=\"{}\",Process=\"{}\"}} {}",
-            cgroup_name,
-            process_info.pid,
-            process_name,
-            sent + received
-        )?;
-    }
-
-    // 写入IP流量统计
-    // 按源IP+目标IP组合聚合
-    let mut ip_pair_agg: HashMap<(u32, u32), u64> = HashMap::new();
-    
-    for ((src_ip, dst_ip), bytes) in ip_traffic.iter() {
-        // 确保源IP和目标IP的顺序一致（较小的IP作为源IP）
-        let (src, dst) = if src_ip <= dst_ip {
-            (*src_ip, *dst_ip)
-        } else {
-            (*dst_ip, *src_ip)
-        };
-        *ip_pair_agg.entry((src, dst)).or_insert(0) += bytes;
-    }
-
-    // 写入聚合后的IP对统计
-    for ((src_ip, dst_ip), bytes) in ip_pair_agg.iter() {
-        writeln!(writer, "ebpf_ip_traffic_1m_stats{{sip=\"{}\",dip=\"{}\"}} {}",
-            format_ip(*src_ip),
-            format_ip(*dst_ip),
-            bytes
-        )?;
+        // 写入发送流量
+        if *sent > 0 {
+            debug!("Writing sent traffic - cgroup={}, pid={}, process={}, src_ip={}, dst_ip={}, bytes={}",
+                cgroup_name, process_info.pid, process_name, format_ip(*src_ip), format_ip(*dst_ip), sent);
+            writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",process=\"{}\",src_ip=\"{}\",dst_ip=\"{}\"}} {}",
+                cgroup_name,
+                process_info.pid,
+                process_name,
+                format_ip(*src_ip),
+                format_ip(*dst_ip),
+                sent
+            )?;
+        }
+        
+        // 写入接收流量
+        if *received > 0 {
+            debug!("Writing received traffic - cgroup={}, pid={}, process={}, src_ip={}, dst_ip={}, bytes={}",
+                cgroup_name, process_info.pid, process_name, format_ip(*dst_ip), format_ip(*src_ip), received);
+            writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",process=\"{}\",src_ip=\"{}\",dst_ip=\"{}\"}} {}",
+                cgroup_name,
+                process_info.pid,
+                process_name,
+                format_ip(*dst_ip),
+                format_ip(*src_ip),
+                received
+            )?;
+        }
     }
 
     writer.flush()?;
@@ -280,8 +472,41 @@ fn cleanup_inactive_entries(
     Ok(())
 }
 
+// 添加日志清理函数
+fn cleanup_old_logs(log_dir: &str, retention_days: u64) -> anyhow::Result<()> {
+    let log_path = Path::new(log_dir);
+    if !log_path.exists() {
+        return Ok(());
+    }
+
+    let now = Local::now();
+    let retention_duration = chrono::Duration::days(retention_days as i64);
+
+    for entry in fs::read_dir(log_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        
+        if path.is_file() && path.extension().map_or(false, |ext| ext == "prom") {
+            if let Ok(metadata) = fs::metadata(&path) {
+                if let Ok(modified) = metadata.modified() {
+                    let modified: DateTime<Local> = modified.into();
+                    if now.signed_duration_since(modified) > retention_duration {
+                        fs::remove_file(path)?;
+                        info!("Removed old log file: {}", entry.file_name().to_string_lossy());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 解析命令行参数
+    let args = Args::parse();
+
     // 设置日志格式和级别
     let mut builder = Builder::from_default_env();
     builder
@@ -306,11 +531,31 @@ async fn main() -> anyhow::Result<()> {
                     record.args()
                 )
             }
-        })
-        .filter(None, log::LevelFilter::Info)
-        .init();
+        });
+
+    // 根据命令行参数设置日志级别
+    let log_level = match args.log_level.to_lowercase().as_str() {
+        "debug" => log::LevelFilter::Debug,
+        "info" => log::LevelFilter::Info,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        _ => {
+            eprintln!("Invalid log level: {}. Using default level: info", args.log_level);
+            log::LevelFilter::Info
+        }
+    };
+    builder.filter(None, log_level).init();
 
     info!("Starting traffic collector...");
+    info!("Using configuration:");
+    info!("  Rules file: {}", args.rules);
+    info!("  Log directory: {}", args.log_dir);
+    if args.log_retention_days > 0 {
+        info!("  Log retention: {} days", args.log_retention_days);
+    } else {
+        info!("  Log retention: disabled");
+    }
+    info!("  Log level: {}", args.log_level);
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -369,6 +614,7 @@ async fn main() -> anyhow::Result<()> {
 
         println!("Starting traffic monitoring...");
         let mut last_print_time = Local::now();
+        let mut last_cleanup_time = Local::now();
         
         loop {
             // 计算下一个整分钟的时间
@@ -388,6 +634,14 @@ async fn main() -> anyhow::Result<()> {
             // 获取当前时间
             let current_time = Local::now();
             
+            // 检查是否需要清理日志（每小时检查一次）
+            if args.log_retention_days > 0 && (current_time - last_cleanup_time).num_hours() >= 1 {
+                if let Err(e) = cleanup_old_logs(&args.log_dir, args.log_retention_days) {
+                    error!("Failed to cleanup old logs: {}", e);
+                }
+                last_cleanup_time = current_time;
+            }
+            
             // 只有当距离上次打印超过1分钟时才打印统计信息
             if (current_time - last_print_time).num_seconds() >= 60 {
                 // 执行清理
@@ -395,9 +649,38 @@ async fn main() -> anyhow::Result<()> {
                     error!("Failed to cleanup inactive entries: {}", e);
                 }
                 
-                // 获取当前所有进程的流量数据
-                let mut process_traffic: HashMap<ProcessInfo, (u64, u64)> = HashMap::new();
-                let mut ip_traffic: HashMap<(u32, u32), u64> = HashMap::new();
+                // 加载过滤规则
+                let filter_rules = match load_filter_rules(&args.rules) {
+                    Ok(rules) => {
+                        info!("Loaded {} filter rules:", rules.len());
+                        for (i, rule) in rules.iter().enumerate() {
+                            info!("Rule {}:", i + 1);
+                            if let Some(pattern) = &rule.cgroup_pattern {
+                                info!("  CGroup pattern: {}", pattern);
+                            }
+                            if let Some(pattern) = &rule.pid_pattern {
+                                info!("  PID pattern: {}", pattern);
+                            }
+                            if let Some(pattern) = &rule.process_pattern {
+                                info!("  Process pattern: {}", pattern);
+                            }
+                            if let Some(pattern) = &rule.src_ip_pattern {
+                                info!("  Source IP pattern: {}", pattern);
+                            }
+                            if let Some(pattern) = &rule.dst_ip_pattern {
+                                info!("  Destination IP pattern: {}", pattern);
+                            }
+                        }
+                        rules
+                    }
+                    Err(e) => {
+                        warn!("Failed to load filter rules: {}", e);
+                        Vec::new()
+                    }
+                };
+                
+                // 在主循环中修改统计逻辑
+                let mut traffic_stats: HashMap<ProcessInfo, TrafficStats> = HashMap::new();
                 let mut total_sent: u64 = 0;
                 let mut total_received: u64 = 0;
                 let mut unique_processes: std::collections::HashSet<ProcessInfo> = std::collections::HashSet::new();
@@ -407,24 +690,50 @@ async fn main() -> anyhow::Result<()> {
                     match entry {
                         Ok((process_info, stats)) => {
                             unique_processes.insert(process_info.clone());
-                            if stats.bytes_sent > 0 || stats.bytes_received > 0 {
-                                process_traffic.insert(process_info.clone(), (stats.bytes_sent, stats.bytes_received));
-                                total_sent += stats.bytes_sent;
-                                total_received += stats.bytes_received;
+                            
+                            // 应用进程过滤规则（白名单）
+                            if should_include_process(&process_info, &filter_rules) {
+                                // 确保源IP和目标IP的顺序一致（较小的IP作为源IP）
+                                let (src, dst) = if stats.src_ip <= stats.dst_ip {
+                                    (stats.src_ip as u32, stats.dst_ip as u32)
+                                } else {
+                                    (stats.dst_ip as u32, stats.src_ip as u32)
+                                };
                                 
-                                // 更新IP流量统计
-                                if stats.ip_traffic > 0 {
-                                    let key = (process_info.src_ip, process_info.dst_ip);
-                                    let entry = ip_traffic.entry(key).or_insert(0);
-                                    *entry += stats.ip_traffic;
+                                // 如果不应该排除这个IP，则包含它
+                                if !should_exclude_ip(src, dst, &filter_rules) {
+                                    // 更新流量统计
+                                    let mut current_stats = stats.clone();
+                                    
+                                    // 根据方向更新发送和接收的字节数
+                                    if stats.direction == 0 {
+                                        current_stats.bytes_sent = stats.bytes_sent;
+                                        current_stats.bytes_received = 0;
+                                        total_sent += stats.bytes_sent;
+                                    } else {
+                                        current_stats.bytes_sent = 0;
+                                        current_stats.bytes_received = stats.bytes_received;
+                                        total_received += stats.bytes_received;
+                                    }
+                                    
+                                    // 使用进程信息和IP对作为键
+                                    let mut key_process_info = process_info.clone();
+                                    key_process_info.src_ip = src;
+                                    key_process_info.dst_ip = dst;
+                                    
+                                    // 更新或插入统计信息
+                                    traffic_stats.insert(key_process_info, current_stats);
+                                    
+                                    debug!("Raw traffic data - cgroup={}, pid={}, process={}, src_ip={}, dst_ip={}: sent={}, received={}, direction={}", 
+                                        process_info.cgroup_id, 
+                                        process_info.pid,
+                                        get_process_name(&process_info.comm),
+                                        format_ip(src),
+                                        format_ip(dst),
+                                        current_stats.bytes_sent,
+                                        current_stats.bytes_received,
+                                        stats.direction);
                                 }
-                                
-                                debug!("Found traffic for cgroup={}, pid={}, comm={}: sent={}, received={}", 
-                                    process_info.cgroup_id, 
-                                    process_info.pid,
-                                    get_process_name(&process_info.comm),
-                                    stats.bytes_sent,
-                                    stats.bytes_received);
                             }
                         }
                         Err(e) => {
@@ -436,11 +745,9 @@ async fn main() -> anyhow::Result<()> {
 
                 // 写入统计信息到文件
                 if let Err(e) = write_stats_to_file(
-                    &process_traffic,
-                    &ip_traffic,
-                    total_sent,
-                    total_received,
+                    &traffic_stats,
                     current_time,
+                    &filter_rules,
                 ) {
                     error!("Failed to write stats to file: {}", e);
                 }
@@ -453,37 +760,26 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 info!("Traffic stats for last minute:");
-                debug!("{:<20} {:<8} {:<20} {:<15} {:<15} {:<15}", 
-                    "CGroup", "PID", "Process", "Bytes Sent", "Bytes Received", "Total");
+                debug!("{:<20} {:<8} {:<20} {:<15} {:<15} {:<15} {:<15} {:<15}", 
+                    "CGroup", "PID", "Process", "Source IP", "Dest IP", "Bytes Sent", "Bytes Received", "Total");
                 
-                if process_traffic.is_empty() {
+                if traffic_stats.is_empty() {
                     debug!("No traffic detected in the last minute");
                 } else {
-                    for (process_info, (sent, received)) in process_traffic.iter() {
+                    for (process_info, stats) in traffic_stats.iter() {
                         let cgroup_name = get_cgroup_name(process_info.cgroup_id);
                         let process_name = get_process_name(&process_info.comm);
+                        let total = stats.bytes_sent + stats.bytes_received;
                         
-                        debug!("{:<20} {:<8} {:<20} {:<15} {:<15} {:<15}", 
+                        debug!("{:<20} {:<8} {:<20} {:<15} {:<15} {:<15} {:<15} {:<15}", 
                             cgroup_name,
                             process_info.pid,
                             process_name,
-                            sent,
-                            received,
-                            sent + received);
-                    }
-                }
-
-                debug!("\nIP Traffic stats for last minute:");
-                debug!("{:<20} {:<20} {:<15}", "Source IP", "Destination IP", "Total Traffic");
-                
-                if ip_traffic.is_empty() {
-                    info!("No IP traffic detected in the last minute");
-                } else {
-                    for ((src_ip, dst_ip), bytes) in ip_traffic.iter() {
-                        debug!("{:<20} {:<20} {:<15}", 
-                            format_ip(*src_ip),
-                            format_ip(*dst_ip),
-                            bytes);
+                            format_ip(stats.src_ip as u32),
+                            format_ip(stats.dst_ip as u32),
+                            stats.bytes_sent,
+                            stats.bytes_received,
+                            total);
                     }
                 }
 

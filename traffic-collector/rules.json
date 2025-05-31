@@ -1,0 +1,6 @@
+[
+    {
+        "cgroup": "cgroup_*",
+        "process": "frpc"
+      }
+]

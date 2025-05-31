@@ -1,0 +1,25 @@
+[
+  {
+    "cgroup": "system*",
+    "process": "ngin?x"
+  },
+  {
+    "pid": "1000-2000",
+    "process": "redis*"
+  },
+  {
+    "pid": "1000,2000,3000",
+    "process": "python*"
+  },
+  {
+    "src_ip": "192.168.*",
+    "dst_ip": "10.0.0.*"
+  },
+  {
+    "cgroup": "k8s-*",
+    "process": "*service"
+  }
+]
+
+
+

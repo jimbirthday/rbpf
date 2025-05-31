@@ -37,10 +37,12 @@ pub struct ProcessInfo {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TrafficStats {
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub ip_traffic: u64,
-    pub last_activity: u64,
+    pub bytes_sent: u64,      // 8 bytes
+    pub bytes_received: u64,  // 8 bytes
+    pub last_activity: u64,   // 8 bytes
+    pub src_ip: u64,          // 8 bytes (包含 src_ip 和 padding)
+    pub dst_ip: u64,          // 8 bytes (包含 dst_ip 和 padding)
+    pub direction: u64,       // 8 bytes (包含 direction 和 padding)
 }
 
 impl ProcessInfo {
@@ -52,6 +54,19 @@ impl ProcessInfo {
             src_ip,
             dst_ip,
             _pad: 0,
+        }
+    }
+}
+
+impl TrafficStats {
+    pub fn new(src_ip: u32, dst_ip: u32, direction: u8) -> Self {
+        TrafficStats {
+            bytes_sent: 0,
+            bytes_received: 0,
+            last_activity: 0,
+            src_ip: src_ip as u64,
+            dst_ip: dst_ip as u64,
+            direction: direction as u64,
         }
     }
 }
@@ -72,7 +87,6 @@ fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
     let mut comm = [0u8; 16];
     match bpf_get_current_comm() {
         Ok(name) => {
-            // 使用更安全的方式处理进程名
             let mut i = 0;
             while i < 15 {
                 if i < name.len() {
@@ -82,7 +96,7 @@ fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
                 }
                 i += 1;
             }
-            comm[15] = 0;  // 确保以 null 结尾
+            comm[15] = 0;
         }
         Err(e) => {
             info!(&ctx, "Failed to get process name: {}", e);
@@ -100,12 +114,7 @@ fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
     unsafe {
         let mut stats = match TRAFFIC_STATS.get(&process_info) {
             Some(val) => *val,
-            None => TrafficStats {
-                bytes_sent: 0,
-                bytes_received: 0,
-                ip_traffic: 0,
-                last_activity: 0,
-            },
+            None => TrafficStats::new(src_ip, dst_ip, 0),
         };
         
         // 检查是否会发生溢出
@@ -115,16 +124,10 @@ fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
             return Err(1);
         }
         
-        if stats.ip_traffic > u64::MAX - size as u64 {
-            info!(&ctx, "IP traffic counter overflow detected for cgroup={}, pid={}, current={}, adding={}", 
-                cgroup_id, pid, stats.ip_traffic, size);
-            return Err(1);
-        }
-        
         // 更新统计信息
         stats.bytes_sent += size as u64;
-        stats.ip_traffic += size as u64;
         stats.last_activity = bpf_ktime_get_ns();
+        stats.direction = 0; // 发送方向
         
         if let Err(e) = TRAFFIC_STATS.insert(&process_info, &stats, 0) {
             info!(&ctx, "Failed to update traffic stats for cgroup={}, pid={}: error={}", 
@@ -149,7 +152,6 @@ fn try_traffic_collector_recv(ctx: ProbeContext) -> Result<u32, u32> {
     let mut comm = [0u8; 16];
     match bpf_get_current_comm() {
         Ok(name) => {
-            // 使用更安全的方式处理进程名
             let mut i = 0;
             while i < 15 {
                 if i < name.len() {
@@ -159,7 +161,7 @@ fn try_traffic_collector_recv(ctx: ProbeContext) -> Result<u32, u32> {
                 }
                 i += 1;
             }
-            comm[15] = 0;  // 确保以 null 结尾
+            comm[15] = 0;
         }
         Err(e) => {
             info!(&ctx, "Failed to get process name: {}", e);
@@ -177,12 +179,7 @@ fn try_traffic_collector_recv(ctx: ProbeContext) -> Result<u32, u32> {
     unsafe {
         let mut stats = match TRAFFIC_STATS.get(&process_info) {
             Some(val) => *val,
-            None => TrafficStats {
-                bytes_sent: 0,
-                bytes_received: 0,
-                ip_traffic: 0,
-                last_activity: 0,
-            },
+            None => TrafficStats::new(src_ip, dst_ip, 1),
         };
         
         // 检查是否会发生溢出
@@ -192,16 +189,10 @@ fn try_traffic_collector_recv(ctx: ProbeContext) -> Result<u32, u32> {
             return Err(1);
         }
         
-        if stats.ip_traffic > u64::MAX - size as u64 {
-            info!(&ctx, "IP traffic counter overflow detected for cgroup={}, pid={}, current={}, adding={}", 
-                cgroup_id, pid, stats.ip_traffic, size);
-            return Err(1);
-        }
-        
         // 更新统计信息
         stats.bytes_received += size as u64;
-        stats.ip_traffic += size as u64;
         stats.last_activity = bpf_ktime_get_ns();
+        stats.direction = 1; // 接收方向
         
         if let Err(e) = TRAFFIC_STATS.insert(&process_info, &stats, 0) {
             info!(&ctx, "Failed to update traffic stats for cgroup={}, pid={}: error={}", 
