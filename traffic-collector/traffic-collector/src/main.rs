@@ -235,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
                             process_info.cgroup_id, process_info.pid),
                         Err(e) => {
                             if !e.to_string().contains("No such file or directory") {
-                                error!("Failed to reset sent counter for cgroup={}, pid={}: {:?}", 
+                                debug!("Failed to reset sent counter for cgroup={}, pid={}: {:?}", 
                                     process_info.cgroup_id, process_info.pid, e);
                             }
                         }
