@@ -1,0 +1,20 @@
+[package]
+name = "traffic-collector-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+traffic-collector-common = { path = "../traffic-collector-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "traffic-collector"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
