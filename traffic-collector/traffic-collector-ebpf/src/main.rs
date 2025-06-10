@@ -26,49 +26,25 @@ pub fn tcp_recvmsg(ctx: ProbeContext) -> u32 {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ProcessInfo {
-    pub cgroup_id: u64,
-    pub pid: u32,
-    pub comm: [u8; 16],  // 进程名，最多16字节
-    pub src_ip: u32,     // 源IP地址
-    pub dst_ip: u32,     // 目标IP地址
-    _pad: u32,  // 添加填充以确保8字节对齐
+    pub cgroup_id: u64,    // 8 bytes
+    pub pid: u32,          // 4 bytes
+    pub fd: u32,           // 4 bytes
+    pub comm: [u8; 16],    // 16 bytes
+    pub src_ip: u32,       // 4 bytes
+    pub dst_ip: u32,       // 4 bytes
+    _pad: [u8; 8],         // 8 bytes padding to ensure 8-byte alignment
 }
 
+// 定义流量统计结构
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TrafficStats {
     pub bytes_sent: u64,      // 8 bytes
     pub bytes_received: u64,  // 8 bytes
     pub last_activity: u64,   // 8 bytes
-    pub src_ip: u64,          // 8 bytes (包含 src_ip 和 padding)
-    pub dst_ip: u64,          // 8 bytes (包含 dst_ip 和 padding)
-    pub direction: u64,       // 8 bytes (包含 direction 和 padding)
-}
-
-impl ProcessInfo {
-    fn new(cgroup_id: u64, pid: u32, comm: [u8; 16], src_ip: u32, dst_ip: u32) -> Self {
-        ProcessInfo {
-            cgroup_id,
-            pid,
-            comm,
-            src_ip,
-            dst_ip,
-            _pad: 0,
-        }
-    }
-}
-
-impl TrafficStats {
-    pub fn new(src_ip: u32, dst_ip: u32, direction: u8) -> Self {
-        TrafficStats {
-            bytes_sent: 0,
-            bytes_received: 0,
-            last_activity: 0,
-            src_ip: src_ip as u64,
-            dst_ip: dst_ip as u64,
-            direction: direction as u64,
-        }
-    }
+    pub src_ip: u64,          // 8 bytes
+    pub dst_ip: u64,          // 8 bytes
+    pub direction: u64,       // 8 bytes
 }
 
 // 双缓冲区的流量统计映射
@@ -93,6 +69,8 @@ fn get_active_buffer() -> u32 {
 
 fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
     // 获取 tcp_sendmsg 的参数
+    let sock: u64 = ctx.arg(0).ok_or(0u32)?;  // 获取socket指针
+    let fd: u32 = (sock & 0xFFFFFFFF) as u32;  // 从socket指针中提取fd
     let size: u32 = ctx.arg(2).ok_or(0u32)?;
     
     // 获取当前进程信息
@@ -122,10 +100,19 @@ fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
     };
     
     // 获取源IP和目标IP
-    let src_ip: u32 = ctx.arg(0).ok_or(0u32)?;
-    let dst_ip: u32 = ctx.arg(1).ok_or(0u32)?;
+    let src_ip: u32 = ctx.arg(1).ok_or(0u32)?;
+    let dst_ip: u32 = ctx.arg(2).ok_or(0u32)?;
     
-    let process_info = ProcessInfo::new(cgroup_id, pid, comm, src_ip, dst_ip);
+    // 创建 ProcessInfo 结构体
+    let process_info = ProcessInfo {
+        cgroup_id,
+        pid,
+        fd,
+        comm,
+        src_ip,
+        dst_ip,
+        _pad: [0u8; 8],
+    };
     
     // 获取当前活跃的缓冲区
     let active_buffer = get_active_buffer();
@@ -140,7 +127,14 @@ fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
         
         let mut current_stats = match stats {
             Some(&val) => val,
-            None => TrafficStats::new(src_ip, dst_ip, 0),
+            None => TrafficStats {
+                bytes_sent: 0,
+                bytes_received: 0,
+                last_activity: 0,
+                src_ip: src_ip as u64,
+                dst_ip: dst_ip as u64,
+                direction: 0,
+            },
         };
         
         // 检查是否会发生溢出
@@ -174,6 +168,8 @@ fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
 
 fn try_traffic_collector_recv(ctx: ProbeContext) -> Result<u32, u32> {
     // 获取 tcp_recvmsg 的参数
+    let sock: u64 = ctx.arg(0).ok_or(0u32)?;  // 获取socket指针
+    let fd: u32 = (sock & 0xFFFFFFFF) as u32;  // 从socket指针中提取fd
     let size: u32 = ctx.arg(2).ok_or(0u32)?;
     
     // 获取当前进程信息
@@ -203,10 +199,19 @@ fn try_traffic_collector_recv(ctx: ProbeContext) -> Result<u32, u32> {
     };
     
     // 获取源IP和目标IP
-    let src_ip: u32 = ctx.arg(0).ok_or(0u32)?;
-    let dst_ip: u32 = ctx.arg(1).ok_or(0u32)?;
+    let src_ip: u32 = ctx.arg(1).ok_or(0u32)?;
+    let dst_ip: u32 = ctx.arg(2).ok_or(0u32)?;
     
-    let process_info = ProcessInfo::new(cgroup_id, pid, comm, src_ip, dst_ip);
+    // 创建 ProcessInfo 结构体
+    let process_info = ProcessInfo {
+        cgroup_id,
+        pid,
+        fd,
+        comm,
+        src_ip,
+        dst_ip,
+        _pad: [0u8; 8],
+    };
     
     // 获取当前活跃的缓冲区
     let active_buffer = get_active_buffer();
@@ -221,7 +226,14 @@ fn try_traffic_collector_recv(ctx: ProbeContext) -> Result<u32, u32> {
         
         let mut current_stats = match stats {
             Some(&val) => val,
-            None => TrafficStats::new(src_ip, dst_ip, 1),
+            None => TrafficStats {
+                bytes_sent: 0,
+                bytes_received: 0,
+                last_activity: 0,
+                src_ip: src_ip as u64,
+                dst_ip: dst_ip as u64,
+                direction: 1,
+            },
         };
         
         // 检查是否会发生溢出

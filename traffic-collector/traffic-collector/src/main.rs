@@ -21,31 +21,35 @@ use clap::Parser;
 use std::io::Read;
 use glob::Pattern;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// 流量收集器配置
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// 日志文件目录
-    #[arg(short = 'l', long, default_value = "/var/log/mx-cIndicator")]
-    log_dir: String,
+    /// Statistics duration in seconds
+    #[arg(short = 't', long, default_value = "60")]
+    duration: u64,
 
-    /// 日志保留天数（0表示不清理）
-    #[arg(short = 'd', long, default_value = "7")]
-    log_retention_days: u64,
-
-    /// 日志级别 (debug, info, warn, error)
-    #[arg(short = 'v', long, default_value = "info")]
-    log_level: String,
-
-    /// 统计时长（秒），debug模式下默认为10秒
-    #[arg(short = 't', long)]
-    stats_duration: Option<u64>,
-
-    /// 规则文件路径
+    /// Rules file path
     #[arg(short = 'r', long, default_value = "rules.json")]
     rules_file: String,
+
+    /// Log level (info, debug, trace)
+    #[arg(short = 'L', long, default_value = "info")]
+    log_level: String,
+
+    /// Log directory
+    #[arg(short = 'd', long, default_value = "/var/log/mx-cIndicator")]
+    log_dir: String,
+
+    /// Verbose level (0: Info, 1: Debug, 2: Trace)
+    #[arg(short = 'v', long, default_value = "0")]
+    verbose: u8,
 }
+
+// 定义最小流量阈值（字节）
+const MIN_TRAFFIC_THRESHOLD: u64 = 1024; // 1KB
 
 // 定义进程信息结构，需要与 eBPF 程序中的结构体匹配
 #[repr(C)]
@@ -53,6 +57,7 @@ struct Args {
 pub struct ProcessInfo {
     pub cgroup_id: u64,
     pub pid: u32,
+    pub fd: u32,      // 添加文件描述符
     pub comm: [u8; 16],
     pub src_ip: u32,     // 源IP地址
     pub dst_ip: u32,     // 目标IP地址
@@ -186,14 +191,40 @@ fn is_process_matched(process_name: &str, cgroup_name: &str, rule: &Rule) -> boo
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     
-    let mut builder = Builder::from_default_env();
-    builder.filter(None, log::LevelFilter::Info).init();
+    // 设置日志级别
+    let log_level = match args.verbose {
+        0 => log::LevelFilter::Info,
+        1 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    };
+
+    // 配置日志
+    let mut builder = env_logger::Builder::new();
+    builder
+        .filter_level(log_level)
+        .format_timestamp_millis()
+        .format_module_path(false)
+        .format_target(false)
+        .format_indent(None)
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{} {}] {}",
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        });
+
+    // 初始化日志
+    builder.init();
+    info!("Starting traffic collector with log level: {}", log_level);
 
     // 设置统计时长
     let stats_duration = if args.log_level == "debug" {
-        args.stats_duration.unwrap_or(10) // debug模式下默认10秒
+        10 // debug模式下固定10秒
     } else {
-        args.stats_duration.unwrap_or(60) // 其他模式默认60秒
+        args.duration // 其他模式使用命令行参数指定的时长
     };
     info!("Statistics duration set to {} seconds", stats_duration);
     info!("Using rules file: {}", args.rules_file);
@@ -399,16 +430,35 @@ async fn main() -> anyhow::Result<()> {
         
         debug!("Using active buffer: {}, clearing buffer: {}", current_buffer, inactive_buffer);
         
-        // 收集数据
+        // 收集数据并按 (pid, fd) 聚合
         let mut entries_to_remove = Vec::new();
         let mut collected_count = 0;
         let mut total_bytes_sent = 0;
         let mut total_bytes_received = 0;
+        let mut connection_stats: HashMap<(u32, u32), (TrafficStats, u64, [u8; 16])> = HashMap::new();
         
         for entry in map.iter() {
             match entry {
                 Ok((process_info, stats)) => {
-                    current_data.push((process_info.clone(), stats.clone()));
+                    // 按 (pid, fd) 聚合流量
+                    let key = (process_info.pid, process_info.fd);
+                    let entry = connection_stats.entry(key).or_insert((
+                        TrafficStats {
+                            bytes_sent: 0,
+                            bytes_received: 0,
+                            last_activity: stats.last_activity,
+                            src_ip: stats.src_ip,
+                            dst_ip: stats.dst_ip,
+                            direction: stats.direction,
+                        },
+                        process_info.cgroup_id,
+                        process_info.comm,
+                    ));
+                    
+                    // 累加流量
+                    entry.0.bytes_sent += stats.bytes_sent;
+                    entry.0.bytes_received += stats.bytes_received;
+                    
                     entries_to_remove.push(process_info.clone());
                     collected_count += 1;
                     total_bytes_sent += stats.bytes_sent;
@@ -417,9 +467,10 @@ async fn main() -> anyhow::Result<()> {
                     // 打印每条收集到的数据
                     let cgroup_name = get_cgroup_name(process_info.cgroup_id);
                     let process_name = get_process_name(&process_info.comm);
-                    debug!("Collected entry: cgroup={}, pid={}, process={}, src_ip={}, dst_ip={}, sent={}, received={}",
+                    debug!("Collected entry: cgroup={}, pid={}, fd={}, process={}, src_ip={}, dst_ip={}, sent={}, received={}",
                         cgroup_name,
                         process_info.pid,
+                        process_info.fd,
                         process_name,
                         format_ip(process_info.src_ip),
                         format_ip(process_info.dst_ip),
@@ -432,6 +483,21 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
             }
+        }
+        
+        // 将聚合后的数据添加到当前周期
+        for ((pid, fd), (stats, cgroup_id, comm)) in connection_stats {
+            // 创建一个新的 ProcessInfo 来存储聚合后的数据
+            let process_info = ProcessInfo {
+                cgroup_id,
+                pid,
+                fd,
+                comm,
+                src_ip: stats.src_ip as u32,
+                dst_ip: stats.dst_ip as u32,
+                _pad: 0,
+            };
+            current_data.push((process_info, stats));
         }
         
         // 打印收集统计
@@ -526,10 +592,16 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
     };
     let mut writer = BufWriter::new(file);
 
+    // 使用 HashMap 来聚合 (pid, fd) 的流量
+    let mut aggregated_traffic: HashMap<(u32, u32), (String, String, u64, u64)> = HashMap::new();
+    let mut raw_traffic_count = 0;
+    let mut aggregated_count = 0;
+
     // 处理当前周期的所有数据
     for (process_info, stats) in data {
         entry_count += 1;
         unique_processes.insert(process_info.clone());
+        raw_traffic_count += 1;
         
         let (src, dst) = if stats.src_ip <= stats.dst_ip {
             (stats.src_ip as u32, stats.dst_ip as u32)
@@ -540,6 +612,16 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
         // 获取进程名和cgroup名
         let process_name = get_process_name(&process_info.comm);
         let cgroup_name = get_cgroup_name(process_info.cgroup_id);
+
+        // 在debug模式下输出原始数据
+        debug!("Raw traffic data: pid={}, fd={}, process={}, cgroup={}, sent={}, received={}",
+            process_info.pid,
+            process_info.fd,
+            process_name,
+            cgroup_name,
+            stats.bytes_sent,
+            stats.bytes_received
+        );
 
         // 检查是否匹配任何规则
         let mut matched = false;
@@ -561,45 +643,66 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
 
         // 只处理匹配规则且不在黑名单中的数据
         if matched && !blacklisted {
-            // 写入发送流量
-            if stats.bytes_sent > 0 {
-                debug!("Writing sent traffic - cgroup={}, pid={}, process={}, src_ip={}, dst_ip={}, bytes={}",
-                    cgroup_name, process_info.pid, process_name, format_ip(src), format_ip(dst), stats.bytes_sent);
-                if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",process=\"{}\",src_ip=\"{}\",dst_ip=\"{}\",direction=\"sent\"}} {}",
-                    cgroup_name,
-                    process_info.pid,
-                    process_name,
-                    format_ip(src),
-                    format_ip(dst),
-                    stats.bytes_sent
-                ) {
-                    error!("Failed to write sent traffic data: {}", e);
-                }
-                total_sent += stats.bytes_sent;
-            }
+            // 聚合 (pid, fd) 的流量
+            let key = (process_info.pid, process_info.fd);
+            let entry = aggregated_traffic.entry(key).or_insert((
+                cgroup_name.clone(),
+                process_name.clone(),
+                0,
+                0
+            ));
+            
+            // 累加流量
+            entry.2 += stats.bytes_sent;
+            entry.3 += stats.bytes_received;
+            aggregated_count += 1;
 
-            // 写入接收流量
-            if stats.bytes_received > 0 {
-                debug!("Writing received traffic - cgroup={}, pid={}, process={}, src_ip={}, dst_ip={}, bytes={}",
-                    cgroup_name, process_info.pid, process_name, format_ip(dst), format_ip(src), stats.bytes_received);
-                if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",process=\"{}\",src_ip=\"{}\",dst_ip=\"{}\",direction=\"received\"}} {}",
-                    cgroup_name,
-                    process_info.pid,
-                    process_name,
-                    format_ip(dst),
-                    format_ip(src),
-                    stats.bytes_received
-                ) {
-                    error!("Failed to write received traffic data: {}", e);
-                }
-                total_received += stats.bytes_received;
-            }
+            debug!("Aggregating traffic for pid={}, fd={}: sent={}, received={}",
+                process_info.pid, process_info.fd, stats.bytes_sent, stats.bytes_received);
+        }
+    }
 
-            debug!("Traffic accepted: process={}, cgroup={}, src={}, dst={}",
-                process_name, cgroup_name, format_ip(src), format_ip(dst));
-        } else {
-            debug!("Traffic filtered out: process={}, cgroup={}, src={}, dst={}, matched={}, blacklisted={}",
-                process_name, cgroup_name, format_ip(src), format_ip(dst), matched, blacklisted);
+    // 在debug模式下输出聚合后的数据
+    debug!("Traffic aggregation summary:");
+    debug!("Raw traffic entries: {}", raw_traffic_count);
+    debug!("Aggregated entries: {}", aggregated_count);
+    debug!("Aggregation ratio: {:.2}%", (aggregated_count as f64 / raw_traffic_count as f64) * 100.0);
+
+    // 写入聚合后的流量数据
+    for ((pid, fd), (cgroup_name, process_name, sent, received)) in aggregated_traffic {
+        // 在debug模式下输出聚合后的详细数据
+        debug!("Aggregated traffic: pid={}, fd={}, process={}, cgroup={}, sent={}, received={}",
+            pid, fd, process_name, cgroup_name, sent, received);
+
+        // 只处理超过阈值的流量
+        if sent >= MIN_TRAFFIC_THRESHOLD {
+            debug!("Writing sent traffic - cgroup={}, pid={}, fd={}, process={}, bytes={}",
+                cgroup_name, pid, fd, process_name, sent);
+            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",fd=\"{}\",process=\"{}\",direction=\"sent\"}} {}",
+                cgroup_name,
+                pid,
+                fd,
+                process_name,
+                sent
+            ) {
+                error!("Failed to write sent traffic data: {}", e);
+            }
+            total_sent += sent;
+        }
+
+        if received >= MIN_TRAFFIC_THRESHOLD {
+            debug!("Writing received traffic - cgroup={}, pid={}, fd={}, process={}, bytes={}",
+                cgroup_name, pid, fd, process_name, received);
+            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",fd=\"{}\",process=\"{}\",direction=\"received\"}} {}",
+                cgroup_name,
+                pid,
+                fd,
+                process_name,
+                received
+            ) {
+                error!("Failed to write received traffic data: {}", e);
+            }
+            total_received += received;
         }
     }
 
@@ -658,5 +761,134 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
     info!("{:<20} {}", "Send Rate:", format_rate(sent_rate));
     info!("{:<20} {}", "Receive Rate:", format_rate(received_rate));
     info!("{:<20} {}", "Total Rate:", format_rate(total_rate));
+}
+
+fn process_traffic_stats(
+    data: Vec<(ProcessInfo, TrafficStats)>,
+    rules: &[Rule],
+    writer: &mut BufWriter<File>,
+) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    let mut total_sent = 0u64;
+    let mut total_received = 0u64;
+    let mut entry_count = 0u64;
+    let mut unique_processes = HashSet::new();
+
+    debug!("Processing {} traffic entries", data.len());
+
+    // 使用 HashMap 来聚合 (pid, fd) 的流量
+    let mut aggregated_traffic: HashMap<(u32, u32), (String, String, u64, u64)> = HashMap::new();
+    let mut raw_traffic_count = 0;
+    let mut aggregated_count = 0;
+
+    // 处理当前周期的所有数据
+    for (process_info, stats) in data {
+        entry_count += 1;
+        unique_processes.insert(process_info.clone());
+        raw_traffic_count += 1;
+        
+        let (src, dst) = if stats.src_ip <= stats.dst_ip {
+            (stats.src_ip as u32, stats.dst_ip as u32)
+        } else {
+            (stats.dst_ip as u32, stats.src_ip as u32)
+        };
+        
+        // 获取进程名和cgroup名
+        let process_name = get_process_name(&process_info.comm);
+        let cgroup_name = get_cgroup_name(process_info.cgroup_id);
+
+        // 在debug模式下输出原始数据
+        debug!("Raw traffic data: pid={}, fd={}, process={}, cgroup={}, sent={}, received={}",
+            process_info.pid,
+            process_info.fd,
+            process_name,
+            cgroup_name,
+            stats.bytes_sent,
+            stats.bytes_received
+        );
+
+        // 检查是否匹配任何规则
+        let mut matched = false;
+        let mut blacklisted = false;
+
+        for rule in rules {
+            if is_process_matched(&process_name, &cgroup_name, rule) {
+                matched = true;
+                // 检查IP是否在黑名单中
+                if is_ip_blacklisted(src, &rule.blacklist_ips) || 
+                   is_ip_blacklisted(dst, &rule.blacklist_ips) {
+                    blacklisted = true;
+                    debug!("Traffic blacklisted: process={}, cgroup={}, src={}, dst={}",
+                        process_name, cgroup_name, format_ip(src), format_ip(dst));
+                    break;
+                }
+            }
+        }
+
+        // 只处理匹配规则且不在黑名单中的数据
+        if matched && !blacklisted {
+            // 聚合 (pid, fd) 的流量
+            let key = (process_info.pid, process_info.fd);
+            let entry = aggregated_traffic.entry(key).or_insert((
+                cgroup_name.clone(),
+                process_name.clone(),
+                0,
+                0
+            ));
+            
+            // 累加流量
+            entry.2 += stats.bytes_sent;
+            entry.3 += stats.bytes_received;
+            aggregated_count += 1;
+
+            debug!("Aggregating traffic for pid={}, fd={}: sent={}, received={}",
+                process_info.pid, process_info.fd, stats.bytes_sent, stats.bytes_received);
+        }
+    }
+
+    // 在debug模式下输出聚合后的数据
+    debug!("Traffic aggregation summary:");
+    debug!("Raw traffic entries: {}", raw_traffic_count);
+    debug!("Aggregated entries: {}", aggregated_count);
+    debug!("Aggregation ratio: {:.2}%", (aggregated_count as f64 / raw_traffic_count as f64) * 100.0);
+
+    // 写入聚合后的流量数据
+    for ((pid, fd), (cgroup_name, process_name, sent, received)) in aggregated_traffic {
+        // 在debug模式下输出聚合后的详细数据
+        debug!("Aggregated traffic: pid={}, fd={}, process={}, cgroup={}, sent={}, received={}",
+            pid, fd, process_name, cgroup_name, sent, received);
+
+        // 只处理超过阈值的流量
+        if sent >= MIN_TRAFFIC_THRESHOLD {
+            debug!("Writing sent traffic - cgroup={}, pid={}, fd={}, process={}, bytes={}",
+                cgroup_name, pid, fd, process_name, sent);
+            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",fd=\"{}\",process=\"{}\",direction=\"sent\"}} {}",
+                cgroup_name,
+                pid,
+                fd,
+                process_name,
+                sent
+            ) {
+                error!("Failed to write sent traffic data: {}", e);
+            }
+            total_sent += sent;
+        }
+
+        if received >= MIN_TRAFFIC_THRESHOLD {
+            debug!("Writing received traffic - cgroup={}, pid={}, fd={}, process={}, bytes={}",
+                cgroup_name, pid, fd, process_name, received);
+            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",fd=\"{}\",process=\"{}\",direction=\"received\"}} {}",
+                cgroup_name,
+                pid,
+                fd,
+                process_name,
+                received
+            ) {
+                error!("Failed to write received traffic data: {}", e);
+            }
+            total_received += received;
+        }
+    }
+
+    Ok((total_sent, total_received))
 }
 
