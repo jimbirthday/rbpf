@@ -1,0 +1,27 @@
+// 写入发送流量
+if *sent > 0 {
+    debug!("Writing sent traffic - cgroup={}, pid={}, process={}, src_ip={}, dst_ip={}, bytes={}",
+        cgroup_name, process_info.pid, process_name, format_ip(*src_ip), format_ip(*dst_ip), sent);
+    writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",process=\"{}\",src_ip=\"{}\",dst_ip=\"{}\",direction=\"sent\"}} {}",
+        cgroup_name,
+        process_info.pid,
+        process_name,
+        format_ip(*src_ip),
+        format_ip(*dst_ip),
+        sent
+    )?;
+}
+
+// 写入接收流量
+if *received > 0 {
+    debug!("Writing received traffic - cgroup={}, pid={}, process={}, src_ip={}, dst_ip={}, bytes={}",
+        cgroup_name, process_info.pid, process_name, format_ip(*dst_ip), format_ip(*src_ip), received);
+    writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",process=\"{}\",src_ip=\"{}\",dst_ip=\"{}\",direction=\"received\"}} {}",
+        cgroup_name,
+        process_info.pid,
+        process_name,
+        format_ip(*dst_ip),
+        format_ip(*src_ip),
+        received
+    )?;
+}

@@ -1,25 +1,30 @@
 [
   {
-    "cgroup": "system*",
-    "process": "ngin?x"
+      "cgroup": "cgroup_*",
+      "process": "frpc*",
+      "blacklist_ips": ["192.168.1.*", "10.0.0.*"]
   },
   {
-    "pid": "1000-2000",
-    "process": "redis*"
-  },
-  {
-    "pid": "1000,2000,3000",
-    "process": "python*"
-  },
-  {
-    "src_ip": "192.168.*",
-    "dst_ip": "10.0.0.*"
-  },
-  {
-    "cgroup": "k8s-*",
-    "process": "*service"
+      "cgroup": "*",
+      "process": "nginx*",
+      "blacklist_ips": ["172.16.*.*"]
   }
 ]
 
+[
+  {
+      "cgroup": "cgroup_*",
+      "process": "nexus*",
+      "blacklist_ips": []
+  }
+]
+
+
+[
+    {
+        "cgroup": "*",
+        "process": "*nexusplugin"
+      }
+]
 
 

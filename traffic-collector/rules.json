@@ -1,6 +1,7 @@
 [
-    {
-        "cgroup": "cgroup_*",
-        "process": "frpc"
-      }
+  {
+      "cgroup": "cgroup_*",
+      "process": "frpc*",
+      "blacklist_ips": []
+  }
 ]

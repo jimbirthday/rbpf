@@ -71,8 +71,25 @@ impl TrafficStats {
     }
 }
 
-#[map(name = "traffic_stats")]
-static mut TRAFFIC_STATS: HashMap<ProcessInfo, TrafficStats> = HashMap::with_max_entries(600000, 0);
+// 双缓冲区的流量统计映射
+#[map(name = "traffic_stats_0")]
+static mut TRAFFIC_STATS_0: HashMap<ProcessInfo, TrafficStats> = HashMap::with_max_entries(600000, 0);
+
+#[map(name = "traffic_stats_1")]
+static mut TRAFFIC_STATS_1: HashMap<ProcessInfo, TrafficStats> = HashMap::with_max_entries(600000, 0);
+
+// 控制映射，用于指示当前活跃的缓冲区
+#[map(name = "control_map")]
+static mut CONTROL_MAP: HashMap<u32, u32> = HashMap::with_max_entries(1, 0);
+
+fn get_active_buffer() -> u32 {
+    unsafe {
+        match CONTROL_MAP.get(&0) {
+            Some(&index) => index,
+            None => 0, // 默认使用第一个缓冲区
+        }
+    }
+}
 
 fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
     // 获取 tcp_sendmsg 的参数
@@ -110,26 +127,42 @@ fn try_traffic_collector_send(ctx: ProbeContext) -> Result<u32, u32> {
     
     let process_info = ProcessInfo::new(cgroup_id, pid, comm, src_ip, dst_ip);
     
+    // 获取当前活跃的缓冲区
+    let active_buffer = get_active_buffer();
+    
     // 更新统计信息
     unsafe {
-        let mut stats = match TRAFFIC_STATS.get(&process_info) {
-            Some(val) => *val,
+        let stats = match active_buffer {
+            0 => TRAFFIC_STATS_0.get(&process_info),
+            1 => TRAFFIC_STATS_1.get(&process_info),
+            _ => None,
+        };
+        
+        let mut current_stats = match stats {
+            Some(&val) => val,
             None => TrafficStats::new(src_ip, dst_ip, 0),
         };
         
         // 检查是否会发生溢出
-        if stats.bytes_sent > u64::MAX - size as u64 {
+        if current_stats.bytes_sent > u64::MAX - size as u64 {
             info!(&ctx, "Send counter overflow detected for cgroup={}, pid={}, current={}, adding={}", 
-                cgroup_id, pid, stats.bytes_sent, size);
+                cgroup_id, pid, current_stats.bytes_sent, size);
             return Err(1);
         }
         
         // 更新统计信息
-        stats.bytes_sent += size as u64;
-        stats.last_activity = bpf_ktime_get_ns();
-        stats.direction = 0; // 发送方向
+        current_stats.bytes_sent += size as u64;
+        current_stats.last_activity = bpf_ktime_get_ns();
+        current_stats.direction = 0; // 发送方向
         
-        if let Err(e) = TRAFFIC_STATS.insert(&process_info, &stats, 0) {
+        // 根据活跃缓冲区更新数据
+        let result = match active_buffer {
+            0 => TRAFFIC_STATS_0.insert(&process_info, &current_stats, 0),
+            1 => TRAFFIC_STATS_1.insert(&process_info, &current_stats, 0),
+            _ => Err(1),
+        };
+        
+        if let Err(e) = result {
             info!(&ctx, "Failed to update traffic stats for cgroup={}, pid={}: error={}", 
                 cgroup_id, pid, e);
             return Err(1);
@@ -175,26 +208,42 @@ fn try_traffic_collector_recv(ctx: ProbeContext) -> Result<u32, u32> {
     
     let process_info = ProcessInfo::new(cgroup_id, pid, comm, src_ip, dst_ip);
     
+    // 获取当前活跃的缓冲区
+    let active_buffer = get_active_buffer();
+    
     // 更新统计信息
     unsafe {
-        let mut stats = match TRAFFIC_STATS.get(&process_info) {
-            Some(val) => *val,
+        let stats = match active_buffer {
+            0 => TRAFFIC_STATS_0.get(&process_info),
+            1 => TRAFFIC_STATS_1.get(&process_info),
+            _ => None,
+        };
+        
+        let mut current_stats = match stats {
+            Some(&val) => val,
             None => TrafficStats::new(src_ip, dst_ip, 1),
         };
         
         // 检查是否会发生溢出
-        if stats.bytes_received > u64::MAX - size as u64 {
+        if current_stats.bytes_received > u64::MAX - size as u64 {
             info!(&ctx, "Receive counter overflow detected for cgroup={}, pid={}, current={}, adding={}", 
-                cgroup_id, pid, stats.bytes_received, size);
+                cgroup_id, pid, current_stats.bytes_received, size);
             return Err(1);
         }
         
         // 更新统计信息
-        stats.bytes_received += size as u64;
-        stats.last_activity = bpf_ktime_get_ns();
-        stats.direction = 1; // 接收方向
+        current_stats.bytes_received += size as u64;
+        current_stats.last_activity = bpf_ktime_get_ns();
+        current_stats.direction = 1; // 接收方向
         
-        if let Err(e) = TRAFFIC_STATS.insert(&process_info, &stats, 0) {
+        // 根据活跃缓冲区更新数据
+        let result = match active_buffer {
+            0 => TRAFFIC_STATS_0.insert(&process_info, &current_stats, 0),
+            1 => TRAFFIC_STATS_1.insert(&process_info, &current_stats, 0),
+            _ => Err(1),
+        };
+        
+        if let Err(e) = result {
             info!(&ctx, "Failed to update traffic stats for cgroup={}, pid={}: error={}", 
                 cgroup_id, pid, e);
             return Err(1);

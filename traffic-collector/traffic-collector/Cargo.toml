@@ -26,6 +26,9 @@ tokio = { workspace = true, features = [
 chrono = "0.4"
 serde_json = "1.0"
 clap = { version = "4.4", features = ["derive"] }
+crossbeam-channel = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+glob = "0.3"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
