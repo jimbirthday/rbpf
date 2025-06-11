@@ -1,6 +1,6 @@
 use aya::programs::KProbe;
 #[rustfmt::skip]
-use log::{debug, warn, info, error};
+use log::{debug, warn, info, error, trace};
 use tokio::signal;
 use tokio::time::{self, Duration, sleep_until, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +36,7 @@ struct Args {
     rules_file: String,
 
     /// Log level (info, debug, trace)
-    #[arg(short = 'L', long, default_value = "info")]
+    #[arg(short = 'L', long, default_value = "debug")]
     log_level: String,
 
     /// Log directory
@@ -53,63 +53,77 @@ const MIN_TRAFFIC_THRESHOLD: u64 = 1024; // 1KB
 
 // 定义进程信息结构，需要与 eBPF 程序中的结构体匹配
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct ProcessInfo {
-    pub cgroup_id: u64,
-    pub pid: u32,
-    pub fd: u32,      // 添加文件描述符
-    pub comm: [u8; 16],
-    pub src_ip: u32,     // 源IP地址
-    pub dst_ip: u32,     // 目标IP地址
-    _pad: u32,  // 添加填充以确保8字节对齐
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProcessInfoKey {
+    pub cgroup_id: u64,    // 8 bytes
+    pub pid: u32,          // 4 bytes
+    pub comm: [u8; 8],     // 8 bytes - 存储进程名的前8个字符
+    _pad: [u8; 4],         // 4 bytes padding to ensure 8-byte alignment
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct TrafficStats {
+#[derive(Clone, Copy, Debug)]
+pub struct TrafficStatsHeader {
     pub bytes_sent: u64,      // 8 bytes
     pub bytes_received: u64,  // 8 bytes
     pub last_activity: u64,   // 8 bytes
-    pub src_ip: u64,          // 8 bytes (包含 src_ip 和 padding)
-    pub dst_ip: u64,          // 8 bytes (包含 dst_ip 和 padding)
-    pub direction: u64,       // 8 bytes (包含 direction 和 padding)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TrafficStatsNetwork {
+    pub src_ip: u32,          // 4 bytes
+    pub dst_ip: u32,          // 4 bytes
+    pub src_port: u16,        // 2 bytes
+    pub dst_port: u16,        // 2 bytes
+    pub direction: u32,       // 4 bytes
+    _pad: [u8; 4],           // 4 bytes padding to ensure 8-byte alignment
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TrafficStats {
+    pub header: TrafficStatsHeader,
+    pub network: TrafficStatsNetwork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConnectionKey {
+    pub cgroup_id: u64,    // 8 bytes
+    pub src_ip: u32,       // 4 bytes
+    pub dst_ip: u32,       // 4 bytes
+    pub src_port: u16,     // 2 bytes
+    pub dst_port: u16,     // 2 bytes
+    _pad: [u8; 4],         // 4 bytes padding to ensure 8-byte alignment
 }
 
 // 实现 Pod trait
-unsafe impl Pod for ProcessInfo {}
+unsafe impl Pod for ProcessInfoKey {}
+unsafe impl Pod for TrafficStatsHeader {}
+unsafe impl Pod for TrafficStatsNetwork {}
 unsafe impl Pod for TrafficStats {}
-
-impl std::hash::Hash for ProcessInfo {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.cgroup_id.hash(state);
-        self.pid.hash(state);
-        self.comm.hash(state);
-        self.src_ip.hash(state);
-        self.dst_ip.hash(state);
-    }
-}
-
-impl PartialEq for ProcessInfo {
-    fn eq(&self, other: &Self) -> bool {
-        self.cgroup_id == other.cgroup_id && 
-        self.pid == other.pid && 
-        self.comm == other.comm &&
-        self.src_ip == other.src_ip &&
-        self.dst_ip == other.dst_ip
-    }
-}
-
-impl Eq for ProcessInfo {}
 
 // 获取 cgroup 名称的辅助函数
 fn get_cgroup_name(cgroup_id: u64) -> String {
     format!("cgroup_{}", cgroup_id)
 }
 
-// 获取进程名的辅助函数
-fn get_process_name(comm: &[u8; 16]) -> String {
-    let null_pos = comm.iter().position(|&x| x == 0).unwrap_or(16);
-    String::from_utf8_lossy(&comm[..null_pos]).to_string()
+// 修改获取进程名的辅助函数
+fn get_process_name(comm: &[u8; 8], pid: u32) -> String {
+    // 找到第一个null字节的位置
+    let null_pos = comm.iter().position(|&x| x == 0).unwrap_or(comm.len());
+    // 将字节切片转换为字符串
+    let name = String::from_utf8_lossy(&comm[..null_pos]).to_string();
+    if name.is_empty() {
+        // 如果进程名为空，尝试从 /proc 获取进程名
+        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
+            comm.trim().to_string()
+        } else {
+            format!("unknown_{}", pid)
+        }
+    } else {
+        name
+    }
 }
 
 // 添加IP地址格式化函数
@@ -159,32 +173,46 @@ fn is_ip_blacklisted(ip: u32, blacklist: &[String]) -> bool {
 fn is_process_matched(process_name: &str, cgroup_name: &str, rule: &Rule) -> bool {
     // 如果规则中没有指定进程名和cgroup，则匹配所有
     if rule.process.is_empty() && rule.cgroup.is_empty() {
+        debug!("Rule matches all: no process or cgroup specified");
         return true;
     }
 
     // 检查进程名
     let process_matched = if !rule.process.is_empty() {
         if let Ok(pat) = Pattern::new(&rule.process) {
-            pat.matches(process_name)
+            let matched = pat.matches(process_name);
+            debug!("Process name matching: '{}' against pattern '{}' -> {}", 
+                process_name, rule.process, matched);
+            matched
         } else {
+            debug!("Invalid process name pattern: {}", rule.process);
             false
         }
     } else {
+        debug!("No process name pattern specified, matching all");
         true
     };
 
     // 检查cgroup
     let cgroup_matched = if !rule.cgroup.is_empty() {
         if let Ok(pat) = Pattern::new(&rule.cgroup) {
-            pat.matches(cgroup_name)
+            let matched = pat.matches(cgroup_name);
+            debug!("Cgroup matching: '{}' against pattern '{}' -> {}", 
+                cgroup_name, rule.cgroup, matched);
+            matched
         } else {
+            debug!("Invalid cgroup pattern: {}", rule.cgroup);
             false
         }
     } else {
+        debug!("No cgroup pattern specified, matching all");
         true
     };
 
-    process_matched && cgroup_matched
+    let result = process_matched && cgroup_matched;
+    debug!("Final rule match result: {} (process: {}, cgroup: {})", 
+        result, process_matched, cgroup_matched);
+    result
 }
 
 #[tokio::main]
@@ -192,10 +220,14 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     
     // 设置日志级别
-    let log_level = match args.verbose {
-        0 => log::LevelFilter::Info,
-        1 => log::LevelFilter::Debug,
-        _ => log::LevelFilter::Trace,
+    let log_level = match args.log_level.to_lowercase().as_str() {
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => match args.verbose {
+            0 => log::LevelFilter::Info,
+            1 => log::LevelFilter::Debug,
+            _ => log::LevelFilter::Trace,
+        }
     };
 
     // 配置日志
@@ -221,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting traffic collector with log level: {}", log_level);
 
     // 设置统计时长
-    let stats_duration = if args.log_level == "debug" {
+    let stats_duration = if log_level == log::LevelFilter::Debug {
         10 // debug模式下固定10秒
     } else {
         args.duration // 其他模式使用命令行参数指定的时长
@@ -245,7 +277,10 @@ async fn main() -> anyhow::Result<()> {
         env!("OUT_DIR"),
         "/traffic-collector"
     ))) {
-        Ok(ebpf) => ebpf,
+        Ok(ebpf) => {
+            info!("Successfully loaded eBPF program");
+            ebpf
+        },
         Err(e) => {
             error!("Failed to load eBPF program: {}", e);
             return Ok(());
@@ -261,7 +296,10 @@ async fn main() -> anyhow::Result<()> {
 
     let program_send: &mut KProbe = match ebpf.program_mut("tcp_sendmsg") {
         Some(prog) => match prog.try_into() {
-            Ok(prog) => prog,
+            Ok(prog) => {
+                info!("Successfully converted tcp_sendmsg program");
+                prog
+            },
             Err(e) => {
                 error!("Failed to convert tcp_sendmsg program: {}", e);
                 return Ok(());
@@ -277,14 +315,20 @@ async fn main() -> anyhow::Result<()> {
         error!("Failed to load tcp_sendmsg program: {}", e);
         return Ok(());
     }
+    info!("Successfully loaded tcp_sendmsg program");
+
     if let Err(e) = program_send.attach("tcp_sendmsg", 0) {
         error!("Failed to attach tcp_sendmsg program: {}", e);
         return Ok(());
     }
+    info!("Successfully attached tcp_sendmsg program");
 
     let program_recv: &mut KProbe = match ebpf.program_mut("tcp_recvmsg") {
         Some(prog) => match prog.try_into() {
-            Ok(prog) => prog,
+            Ok(prog) => {
+                info!("Successfully converted tcp_recvmsg program");
+                prog
+            },
             Err(e) => {
                 error!("Failed to convert tcp_recvmsg program: {}", e);
                 return Ok(());
@@ -300,10 +344,13 @@ async fn main() -> anyhow::Result<()> {
         error!("Failed to load tcp_recvmsg program: {}", e);
         return Ok(());
     }
+    info!("Successfully loaded tcp_recvmsg program");
+
     if let Err(e) = program_recv.attach("tcp_recvmsg", 0) {
         error!("Failed to attach tcp_recvmsg program: {}", e);
         return Ok(());
     }
+    info!("Successfully attached tcp_recvmsg program");
     
     info!("eBPF programs attached successfully");
 
@@ -311,12 +358,14 @@ async fn main() -> anyhow::Result<()> {
     let mut maps = ebpf.maps_mut();
     let mut traffic_stats_0 = None;
     let mut traffic_stats_1 = None;
+    let mut traffic_network_0 = None;
+    let mut traffic_network_1 = None;
     let mut control_map = None;
 
     for (name, map) in maps {
         match name {
             "traffic_stats_0" => {
-                match aya::maps::HashMap::<&mut aya::maps::MapData, ProcessInfo, TrafficStats>::try_from(map) {
+                match aya::maps::HashMap::<&mut aya::maps::MapData, ProcessInfoKey, TrafficStatsHeader>::try_from(map) {
                     Ok(map) => traffic_stats_0 = Some(map),
                     Err(e) => {
                         error!("Failed to convert traffic_stats_0 map: {}", e);
@@ -325,10 +374,28 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             "traffic_stats_1" => {
-                match aya::maps::HashMap::<&mut aya::maps::MapData, ProcessInfo, TrafficStats>::try_from(map) {
+                match aya::maps::HashMap::<&mut aya::maps::MapData, ProcessInfoKey, TrafficStatsHeader>::try_from(map) {
                     Ok(map) => traffic_stats_1 = Some(map),
                     Err(e) => {
                         error!("Failed to convert traffic_stats_1 map: {}", e);
+                        return Ok(());
+                    }
+                }
+            }
+            "traffic_network_0" => {
+                match aya::maps::HashMap::<&mut aya::maps::MapData, ProcessInfoKey, TrafficStatsNetwork>::try_from(map) {
+                    Ok(map) => traffic_network_0 = Some(map),
+                    Err(e) => {
+                        error!("Failed to convert traffic_network_0 map: {}", e);
+                        return Ok(());
+                    }
+                }
+            }
+            "traffic_network_1" => {
+                match aya::maps::HashMap::<&mut aya::maps::MapData, ProcessInfoKey, TrafficStatsNetwork>::try_from(map) {
+                    Ok(map) => traffic_network_1 = Some(map),
+                    Err(e) => {
+                        error!("Failed to convert traffic_network_1 map: {}", e);
                         return Ok(());
                     }
                 }
@@ -346,7 +413,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut traffic_stats_0: aya::maps::HashMap<&mut aya::maps::MapData, ProcessInfo, TrafficStats> = 
+    let mut traffic_stats_0: aya::maps::HashMap<&mut aya::maps::MapData, ProcessInfoKey, TrafficStatsHeader> = 
         match traffic_stats_0 {
             Some(map) => map,
             None => {
@@ -355,11 +422,29 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-    let mut traffic_stats_1: aya::maps::HashMap<&mut aya::maps::MapData, ProcessInfo, TrafficStats> = 
+    let mut traffic_stats_1: aya::maps::HashMap<&mut aya::maps::MapData, ProcessInfoKey, TrafficStatsHeader> = 
         match traffic_stats_1 {
             Some(map) => map,
             None => {
                 error!("traffic_stats_1 map not found");
+                return Ok(());
+            }
+        };
+
+    let mut traffic_network_0: aya::maps::HashMap<&mut aya::maps::MapData, ProcessInfoKey, TrafficStatsNetwork> = 
+        match traffic_network_0 {
+            Some(map) => map,
+            None => {
+                error!("traffic_network_0 map not found");
+                return Ok(());
+            }
+        };
+
+    let mut traffic_network_1: aya::maps::HashMap<&mut aya::maps::MapData, ProcessInfoKey, TrafficStatsNetwork> = 
+        match traffic_network_1 {
+            Some(map) => map,
+            None => {
+                error!("traffic_network_1 map not found");
                 return Ok(());
             }
         };
@@ -423,81 +508,107 @@ async fn main() -> anyhow::Result<()> {
         // 收集非活跃缓冲区的数据
         let inactive_buffer = 1 - current_buffer;
         let map = if inactive_buffer == 0 {
-            &mut traffic_stats_0
+            (&mut traffic_stats_0, &mut traffic_network_0)
         } else {
-            &mut traffic_stats_1
+            (&mut traffic_stats_1, &mut traffic_network_1)
         };
         
         debug!("Using active buffer: {}, clearing buffer: {}", current_buffer, inactive_buffer);
         
-        // 收集数据并按 (pid, fd) 聚合
+        // 收集数据并按 (cgroup_id, src_ip, dst_ip, src_port, dst_port) 聚合
         let mut entries_to_remove = Vec::new();
         let mut collected_count = 0;
         let mut total_bytes_sent = 0;
         let mut total_bytes_received = 0;
-        let mut connection_stats: HashMap<(u32, u32), (TrafficStats, u64, [u8; 16])> = HashMap::new();
+        let mut connection_stats: HashMap<(u64, u32, u32, u16, u16), (TrafficStatsHeader, TrafficStatsNetwork, u32, u32)> = HashMap::new();
         
-        for entry in map.iter() {
-            match entry {
-                Ok((process_info, stats)) => {
-                    // 按 (pid, fd) 聚合流量
-                    let key = (process_info.pid, process_info.fd);
-                    let entry = connection_stats.entry(key).or_insert((
-                        TrafficStats {
+        // 获取当前活动的 map
+        let (stats_map, network_map) = map;
+        
+        // 打印 map 中的键数量
+        let mut key_count = 0;
+        for _ in stats_map.keys() {
+            key_count += 1;
+        }
+        debug!("Found {} keys in stats map", key_count);
+        
+        // 遍历所有键
+        for key_result in stats_map.keys() {
+            if let Ok(key) = key_result {
+                debug!("Processing key: cgroup_id={}, pid={}, comm={}", 
+                    key.cgroup_id, key.pid, String::from_utf8_lossy(&key.comm));
+                
+                if let (Ok(header), Ok(network)) = (stats_map.get(&key, 0), network_map.get(&key, 0)) {
+                    debug!("Found data in maps: sent={}, received={}, src={}:{}, dst={}:{}",
+                        header.bytes_sent,
+                        header.bytes_received,
+                        format_ip(network.src_ip),
+                        network.src_port,
+                        format_ip(network.dst_ip),
+                        network.dst_port
+                    );
+                    
+                    // 按 (cgroup_id, src_ip, dst_ip, src_port, dst_port) 聚合流量
+                    let conn_key = (key.cgroup_id, network.src_ip, network.dst_ip, 
+                                  network.src_port, network.dst_port);
+                    let entry = connection_stats.entry(conn_key).or_insert((
+                        TrafficStatsHeader {
                             bytes_sent: 0,
                             bytes_received: 0,
-                            last_activity: stats.last_activity,
-                            src_ip: stats.src_ip,
-                            dst_ip: stats.dst_ip,
-                            direction: stats.direction,
+                            last_activity: header.last_activity,
                         },
-                        process_info.cgroup_id,
-                        process_info.comm,
+                        TrafficStatsNetwork {
+                            src_ip: network.src_ip,
+                            dst_ip: network.dst_ip,
+                            src_port: network.src_port,
+                            dst_port: network.dst_port,
+                            direction: network.direction,
+                            _pad: [0u8; 4],
+                        },
+                        key.pid,
+                        key.pid,
                     ));
                     
                     // 累加流量
-                    entry.0.bytes_sent += stats.bytes_sent;
-                    entry.0.bytes_received += stats.bytes_received;
+                    entry.0.bytes_sent += header.bytes_sent;
+                    entry.0.bytes_received += header.bytes_received;
                     
-                    entries_to_remove.push(process_info.clone());
+                    entries_to_remove.push(key.clone());
                     collected_count += 1;
-                    total_bytes_sent += stats.bytes_sent;
-                    total_bytes_received += stats.bytes_received;
+                    total_bytes_sent += header.bytes_sent;
+                    total_bytes_received += header.bytes_received;
 
                     // 打印每条收集到的数据
-                    let cgroup_name = get_cgroup_name(process_info.cgroup_id);
-                    let process_name = get_process_name(&process_info.comm);
-                    debug!("Collected entry: cgroup={}, pid={}, fd={}, process={}, src_ip={}, dst_ip={}, sent={}, received={}",
+                    let cgroup_name = get_cgroup_name(key.cgroup_id);
+                    debug!("Collected entry: cgroup={}, pid={}, src={}:{}, dst={}:{}, sent={}, received={}",
                         cgroup_name,
-                        process_info.pid,
-                        process_info.fd,
-                        process_name,
-                        format_ip(process_info.src_ip),
-                        format_ip(process_info.dst_ip),
-                        stats.bytes_sent,
-                        stats.bytes_received
+                        key.pid,
+                        format_ip(network.src_ip),
+                        network.src_port,
+                        format_ip(network.dst_ip),
+                        network.dst_port,
+                        header.bytes_sent,
+                        header.bytes_received
                     );
+                } else {
+                    debug!("No data found in maps for key: cgroup_id={}, pid={}, comm={}", 
+                        key.cgroup_id, key.pid, String::from_utf8_lossy(&key.comm));
                 }
-                Err(e) => {
-                    error!("Error reading traffic stats map entry: {:?}", e);
-                    continue;
-                }
+            } else {
+                debug!("Failed to get key from map: {:?}", key_result);
             }
         }
         
         // 将聚合后的数据添加到当前周期
-        for ((pid, fd), (stats, cgroup_id, comm)) in connection_stats {
-            // 创建一个新的 ProcessInfo 来存储聚合后的数据
-            let process_info = ProcessInfo {
+        for ((cgroup_id, src_ip, dst_ip, src_port, dst_port), (header, network, pid, comm_hash)) in connection_stats {
+            // 创建一个新的 ProcessInfoKey 来存储聚合后的数据
+            let process_info = ProcessInfoKey {
                 cgroup_id,
                 pid,
-                fd,
-                comm,
-                src_ip: stats.src_ip as u32,
-                dst_ip: stats.dst_ip as u32,
-                _pad: 0,
+                comm: [0; 8],
+                _pad: [0; 4],
             };
-            current_data.push((process_info, stats));
+            current_data.push((process_info, TrafficStats { header, network }));
         }
         
         // 打印收集统计
@@ -512,7 +623,7 @@ async fn main() -> anyhow::Result<()> {
         // 清零非活跃缓冲区
         let mut cleared_count = 0;
         for process_info in entries_to_remove {
-            if let Err(e) = map.remove(&process_info) {
+            if let Err(e) = stats_map.remove(&process_info) {
                 error!("Failed to clear entry from buffer {}: {}", inactive_buffer, e);
             } else {
                 cleared_count += 1;
@@ -523,6 +634,12 @@ async fn main() -> anyhow::Result<()> {
             cleared_count,
             inactive_buffer
         );
+
+        // 立即处理当前周期的数据
+        if !current_data.is_empty() {
+            process_traffic_data(now, &current_data);
+            current_data.clear();
+        }
 
         // 计算下一个统计周期的时间
         let next_period = now + chrono::Duration::seconds(stats_duration as i64);
@@ -538,20 +655,38 @@ async fn main() -> anyhow::Result<()> {
             stats_duration * 1000
         );
         
-        if wait_duration > 0 {
-            std::thread::sleep(Duration::from_millis(wait_duration));
-        }
+        // 使用更短的等待时间，更频繁地检查数据
+        let check_interval = 100; // 每100ms检查一次
+        let mut remaining_wait = wait_duration;
+        
+        while remaining_wait > 0 {
+            let sleep_time = std::cmp::min(check_interval, remaining_wait);
+            tokio::time::sleep(Duration::from_millis(sleep_time)).await;
+            remaining_wait -= sleep_time;
+            
+            // 检查是否有新数据，但不立即处理
+            let current_map = if current_buffer == 0 {
+                (&mut traffic_stats_0, &mut traffic_network_0)
+            } else {
+                (&mut traffic_stats_1, &mut traffic_network_1)
+            };
+            
+            let mut has_new_data = false;
+            for key_result in current_map.0.keys() {
+                if let Ok(key) = key_result {
+                    if let Ok(_) = current_map.0.get(&key, 0) {
+                        has_new_data = true;
+                        break;
+                    }
+                }
+            }
 
-        // 立即处理当前周期的数据
-        if !current_data.is_empty() {
-            process_traffic_data(now, &current_data);
-            current_data.clear();
         }
     }
 }
 
 /// 处理流量数据
-fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, TrafficStats)]) {
+fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfoKey, TrafficStats)]) {
     debug!("Processing traffic data for period: {}", timestamp.format("%Y-%m-%d %H:%M:%S"));
     let start_time = Instant::now();
     let mut total_sent: u64 = 0;
@@ -592,8 +727,8 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
     };
     let mut writer = BufWriter::new(file);
 
-    // 使用 HashMap 来聚合 (pid, fd) 的流量
-    let mut aggregated_traffic: HashMap<(u32, u32), (String, String, u64, u64)> = HashMap::new();
+    // 使用 HashMap 来聚合 (cgroup_id, src_ip, dst_ip, src_port, dst_port) 的流量
+    let mut aggregated_traffic: HashMap<(u64, u32, u32, u16, u16), (String, String, u64, u64)> = HashMap::new();
     let mut raw_traffic_count = 0;
     let mut aggregated_count = 0;
 
@@ -603,24 +738,21 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
         unique_processes.insert(process_info.clone());
         raw_traffic_count += 1;
         
-        let (src, dst) = if stats.src_ip <= stats.dst_ip {
-            (stats.src_ip as u32, stats.dst_ip as u32)
-        } else {
-            (stats.dst_ip as u32, stats.src_ip as u32)
-        };
-        
         // 获取进程名和cgroup名
-        let process_name = get_process_name(&process_info.comm);
+        let process_name = get_process_name(&process_info.comm, process_info.pid);
         let cgroup_name = get_cgroup_name(process_info.cgroup_id);
 
-        // 在debug模式下输出原始数据
-        debug!("Raw traffic data: pid={}, fd={}, process={}, cgroup={}, sent={}, received={}",
+        // 添加调试信息
+        debug!("Processing traffic - pid: {}, process: {}, cgroup: {}, src: {}:{}, dst: {}:{}, sent: {}, received: {}", 
             process_info.pid,
-            process_info.fd,
             process_name,
             cgroup_name,
-            stats.bytes_sent,
-            stats.bytes_received
+            format_ip(stats.network.src_ip),
+            stats.network.src_port,
+            format_ip(stats.network.dst_ip),
+            stats.network.dst_port,
+            stats.header.bytes_sent,
+            stats.header.bytes_received
         );
 
         // 检查是否匹配任何规则
@@ -630,12 +762,17 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
         for rule in &rules {
             if is_process_matched(&process_name, &cgroup_name, rule) {
                 matched = true;
+                debug!("Traffic matched rule: cgroup='{}', process='{}', blacklist_ips={:?}", 
+                    rule.cgroup, rule.process, rule.blacklist_ips);
+                
                 // 检查IP是否在黑名单中
-                if is_ip_blacklisted(src, &rule.blacklist_ips) || 
-                   is_ip_blacklisted(dst, &rule.blacklist_ips) {
+                if is_ip_blacklisted(stats.network.src_ip, &rule.blacklist_ips) || 
+                   is_ip_blacklisted(stats.network.dst_ip, &rule.blacklist_ips) {
                     blacklisted = true;
-                    debug!("Traffic blacklisted: process={}, cgroup={}, src={}, dst={}",
-                        process_name, cgroup_name, format_ip(src), format_ip(dst));
+                    debug!("Traffic blacklisted: process={}, cgroup={}, src={}:{}, dst={}:{}",
+                        process_name, cgroup_name, 
+                        format_ip(stats.network.src_ip), stats.network.src_port,
+                        format_ip(stats.network.dst_ip), stats.network.dst_port);
                     break;
                 }
             }
@@ -643,8 +780,9 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
 
         // 只处理匹配规则且不在黑名单中的数据
         if matched && !blacklisted {
-            // 聚合 (pid, fd) 的流量
-            let key = (process_info.pid, process_info.fd);
+            // 聚合 (cgroup_id, src_ip, dst_ip, src_port, dst_port) 的流量
+            let key = (process_info.cgroup_id, stats.network.src_ip, stats.network.dst_ip, 
+                      stats.network.src_port, stats.network.dst_port);
             let entry = aggregated_traffic.entry(key).or_insert((
                 cgroup_name.clone(),
                 process_name.clone(),
@@ -653,12 +791,16 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
             ));
             
             // 累加流量
-            entry.2 += stats.bytes_sent;
-            entry.3 += stats.bytes_received;
+            entry.2 += stats.header.bytes_sent;
+            entry.3 += stats.header.bytes_received;
             aggregated_count += 1;
 
-            debug!("Aggregating traffic for pid={}, fd={}: sent={}, received={}",
-                process_info.pid, process_info.fd, stats.bytes_sent, stats.bytes_received);
+            debug!("Aggregating traffic for cgroup={}, pid={}, src={}:{}, dst={}:{}: sent={}, received={}",
+                process_info.cgroup_id, 
+                process_info.pid,
+                format_ip(stats.network.src_ip), stats.network.src_port,
+                format_ip(stats.network.dst_ip), stats.network.dst_port,
+                stats.header.bytes_sent, stats.header.bytes_received);
         }
     }
 
@@ -669,19 +811,25 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
     debug!("Aggregation ratio: {:.2}%", (aggregated_count as f64 / raw_traffic_count as f64) * 100.0);
 
     // 写入聚合后的流量数据
-    for ((pid, fd), (cgroup_name, process_name, sent, received)) in aggregated_traffic {
+    for ((cgroup_id, src_ip, dst_ip, src_port, dst_port), (cgroup_name, process_name, sent, received)) in aggregated_traffic {
         // 在debug模式下输出聚合后的详细数据
-        debug!("Aggregated traffic: pid={}, fd={}, process={}, cgroup={}, sent={}, received={}",
-            pid, fd, process_name, cgroup_name, sent, received);
+        trace!("Aggregated traffic: cgroup={}, src={}:{}, dst={}:{}, process={}, cgroup={}, sent={}, received={}",
+            cgroup_id, 
+            format_ip(src_ip), src_port,
+            format_ip(dst_ip), dst_port,
+            process_name, cgroup_name, sent, received);
 
         // 只处理超过阈值的流量
         if sent >= MIN_TRAFFIC_THRESHOLD {
-            debug!("Writing sent traffic - cgroup={}, pid={}, fd={}, process={}, bytes={}",
-                cgroup_name, pid, fd, process_name, sent);
-            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",fd=\"{}\",process=\"{}\",direction=\"sent\"}} {}",
+            debug!("Writing sent traffic - cgroup={}, src={}:{}, dst={}:{}, process={}, bytes={}",
+                cgroup_name, 
+                format_ip(src_ip), src_port,
+                format_ip(dst_ip), dst_port,
+                process_name, sent);
+            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",src=\"{}\",dst=\"{}\",process=\"{}\",direction=\"sent\"}} {}",
                 cgroup_name,
-                pid,
-                fd,
+                format!("{}:{}", format_ip(src_ip), src_port),
+                format!("{}:{}", format_ip(dst_ip), dst_port),
                 process_name,
                 sent
             ) {
@@ -691,12 +839,15 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
         }
 
         if received >= MIN_TRAFFIC_THRESHOLD {
-            debug!("Writing received traffic - cgroup={}, pid={}, fd={}, process={}, bytes={}",
-                cgroup_name, pid, fd, process_name, received);
-            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",fd=\"{}\",process=\"{}\",direction=\"received\"}} {}",
+            debug!("Writing received traffic - cgroup={}, src={}:{}, dst={}:{}, process={}, bytes={}",
+                cgroup_name, 
+                format_ip(src_ip), src_port,
+                format_ip(dst_ip), dst_port,
+                process_name, received);
+            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",src=\"{}\",dst=\"{}\",process=\"{}\",direction=\"received\"}} {}",
                 cgroup_name,
-                pid,
-                fd,
+                format!("{}:{}", format_ip(src_ip), src_port),
+                format!("{}:{}", format_ip(dst_ip), dst_port),
                 process_name,
                 received
             ) {
@@ -764,7 +915,7 @@ fn process_traffic_data(timestamp: DateTime<Local>, data: &[(ProcessInfo, Traffi
 }
 
 fn process_traffic_stats(
-    data: Vec<(ProcessInfo, TrafficStats)>,
+    data: Vec<(ProcessInfoKey, TrafficStats)>,
     rules: &[Rule],
     writer: &mut BufWriter<File>,
 ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
@@ -775,8 +926,8 @@ fn process_traffic_stats(
 
     debug!("Processing {} traffic entries", data.len());
 
-    // 使用 HashMap 来聚合 (pid, fd) 的流量
-    let mut aggregated_traffic: HashMap<(u32, u32), (String, String, u64, u64)> = HashMap::new();
+    // 使用 HashMap 来聚合 (cgroup_id, src_ip, dst_ip, src_port, dst_port) 的流量
+    let mut aggregated_traffic: HashMap<(u64, u32, u32, u16, u16), (String, String, u64, u64)> = HashMap::new();
     let mut raw_traffic_count = 0;
     let mut aggregated_count = 0;
 
@@ -786,24 +937,21 @@ fn process_traffic_stats(
         unique_processes.insert(process_info.clone());
         raw_traffic_count += 1;
         
-        let (src, dst) = if stats.src_ip <= stats.dst_ip {
-            (stats.src_ip as u32, stats.dst_ip as u32)
-        } else {
-            (stats.dst_ip as u32, stats.src_ip as u32)
-        };
-        
         // 获取进程名和cgroup名
-        let process_name = get_process_name(&process_info.comm);
+        let process_name = get_process_name(&process_info.comm, process_info.pid);
         let cgroup_name = get_cgroup_name(process_info.cgroup_id);
 
         // 在debug模式下输出原始数据
-        debug!("Raw traffic data: pid={}, fd={}, process={}, cgroup={}, sent={}, received={}",
+        debug!("Raw traffic data: pid={}, process={}, cgroup={}, src={}:{}, dst={}:{}, sent={}, received={}",
             process_info.pid,
-            process_info.fd,
             process_name,
             cgroup_name,
-            stats.bytes_sent,
-            stats.bytes_received
+            format_ip(stats.network.src_ip),
+            stats.network.src_port,
+            format_ip(stats.network.dst_ip),
+            stats.network.dst_port,
+            stats.header.bytes_sent,
+            stats.header.bytes_received
         );
 
         // 检查是否匹配任何规则
@@ -814,11 +962,13 @@ fn process_traffic_stats(
             if is_process_matched(&process_name, &cgroup_name, rule) {
                 matched = true;
                 // 检查IP是否在黑名单中
-                if is_ip_blacklisted(src, &rule.blacklist_ips) || 
-                   is_ip_blacklisted(dst, &rule.blacklist_ips) {
+                if is_ip_blacklisted(stats.network.src_ip, &rule.blacklist_ips) || 
+                   is_ip_blacklisted(stats.network.dst_ip, &rule.blacklist_ips) {
                     blacklisted = true;
-                    debug!("Traffic blacklisted: process={}, cgroup={}, src={}, dst={}",
-                        process_name, cgroup_name, format_ip(src), format_ip(dst));
+                    debug!("Traffic blacklisted: process={}, cgroup={}, src={}:{}, dst={}:{}",
+                        process_name, cgroup_name, 
+                        format_ip(stats.network.src_ip), stats.network.src_port,
+                        format_ip(stats.network.dst_ip), stats.network.dst_port);
                     break;
                 }
             }
@@ -826,8 +976,9 @@ fn process_traffic_stats(
 
         // 只处理匹配规则且不在黑名单中的数据
         if matched && !blacklisted {
-            // 聚合 (pid, fd) 的流量
-            let key = (process_info.pid, process_info.fd);
+            // 聚合 (cgroup_id, src_ip, dst_ip, src_port, dst_port) 的流量
+            let key = (process_info.cgroup_id, stats.network.src_ip, stats.network.dst_ip, 
+                      stats.network.src_port, stats.network.dst_port);
             let entry = aggregated_traffic.entry(key).or_insert((
                 cgroup_name.clone(),
                 process_name.clone(),
@@ -836,12 +987,16 @@ fn process_traffic_stats(
             ));
             
             // 累加流量
-            entry.2 += stats.bytes_sent;
-            entry.3 += stats.bytes_received;
+            entry.2 += stats.header.bytes_sent;
+            entry.3 += stats.header.bytes_received;
             aggregated_count += 1;
 
-            debug!("Aggregating traffic for pid={}, fd={}: sent={}, received={}",
-                process_info.pid, process_info.fd, stats.bytes_sent, stats.bytes_received);
+            debug!("Aggregating traffic for cgroup={}, pid={}, src={}:{}, dst={}:{}: sent={}, received={}",
+                process_info.cgroup_id, 
+                process_info.pid,
+                format_ip(stats.network.src_ip), stats.network.src_port,
+                format_ip(stats.network.dst_ip), stats.network.dst_port,
+                stats.header.bytes_sent, stats.header.bytes_received);
         }
     }
 
@@ -852,19 +1007,25 @@ fn process_traffic_stats(
     debug!("Aggregation ratio: {:.2}%", (aggregated_count as f64 / raw_traffic_count as f64) * 100.0);
 
     // 写入聚合后的流量数据
-    for ((pid, fd), (cgroup_name, process_name, sent, received)) in aggregated_traffic {
+    for ((cgroup_id, src_ip, dst_ip, src_port, dst_port), (cgroup_name, process_name, sent, received)) in aggregated_traffic {
         // 在debug模式下输出聚合后的详细数据
-        debug!("Aggregated traffic: pid={}, fd={}, process={}, cgroup={}, sent={}, received={}",
-            pid, fd, process_name, cgroup_name, sent, received);
+        debug!("Aggregated traffic: cgroup={}, src={}:{}, dst={}:{}, process={}, cgroup={}, sent={}, received={}",
+            cgroup_id, 
+            format_ip(src_ip), src_port,
+            format_ip(dst_ip), dst_port,
+            process_name, cgroup_name, sent, received);
 
         // 只处理超过阈值的流量
         if sent >= MIN_TRAFFIC_THRESHOLD {
-            debug!("Writing sent traffic - cgroup={}, pid={}, fd={}, process={}, bytes={}",
-                cgroup_name, pid, fd, process_name, sent);
-            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",fd=\"{}\",process=\"{}\",direction=\"sent\"}} {}",
+            debug!("Writing sent traffic - cgroup={}, src={}:{}, dst={}:{}, process={}, bytes={}",
+                cgroup_name, 
+                format_ip(src_ip), src_port,
+                format_ip(dst_ip), dst_port,
+                process_name, sent);
+            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",src=\"{}\",dst=\"{}\",process=\"{}\",direction=\"sent\"}} {}",
                 cgroup_name,
-                pid,
-                fd,
+                format!("{}:{}", format_ip(src_ip), src_port),
+                format!("{}:{}", format_ip(dst_ip), dst_port),
                 process_name,
                 sent
             ) {
@@ -874,12 +1035,15 @@ fn process_traffic_stats(
         }
 
         if received >= MIN_TRAFFIC_THRESHOLD {
-            debug!("Writing received traffic - cgroup={}, pid={}, fd={}, process={}, bytes={}",
-                cgroup_name, pid, fd, process_name, received);
-            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",pid=\"{}\",fd=\"{}\",process=\"{}\",direction=\"received\"}} {}",
+            debug!("Writing received traffic - cgroup={}, src={}:{}, dst={}:{}, process={}, bytes={}",
+                cgroup_name, 
+                format_ip(src_ip), src_port,
+                format_ip(dst_ip), dst_port,
+                process_name, received);
+            if let Err(e) = writeln!(writer, "ebpf_traffic_stats{{cgroup=\"{}\",src=\"{}\",dst=\"{}\",process=\"{}\",direction=\"received\"}} {}",
                 cgroup_name,
-                pid,
-                fd,
+                format!("{}:{}", format_ip(src_ip), src_port),
+                format!("{}:{}", format_ip(dst_ip), dst_port),
                 process_name,
                 received
             ) {

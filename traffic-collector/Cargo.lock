@@ -977,6 +977,7 @@ dependencies = [
 name = "traffic-collector-ebpf"
 version = "0.1.0"
 dependencies = [
+ "aya-build",
  "aya-ebpf",
  "aya-log-ebpf",
  "traffic-collector-common",
